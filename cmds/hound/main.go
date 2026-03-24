@@ -81,6 +81,11 @@ func defaultFlagForHost() string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+		runMCP(os.Args[2:])
+		return
+	}
+
 	flagHost := flag.String("host", defaultFlagForHost(), "")
 	flagRepos := flag.String("repos", "*", "")
 	flagFiles := flag.String("files", "", "")

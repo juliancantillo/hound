@@ -1,4 +1,4 @@
-CMDS := .build/bin/houndd .build/bin/hound .build/bin/hound-mcp
+CMDS := .build/bin/houndd .build/bin/hound
 
 SRCS := $(shell find . -type f -name '*.go')
 UI := $(shell find ui/assets -type f)
@@ -23,9 +23,6 @@ node_modules/build:
 
 .build/bin/hound: $(SRCS)
 	go build -o $@ github.com/hound-search/hound/cmds/hound
-
-.build/bin/hound-mcp: $(SRCS)
-	go build -o $@ github.com/hound-search/hound/cmds/hound-mcp
 
 ui/.build/ui: node_modules/build $(UI)
 	mkdir -p ui/.build/ui

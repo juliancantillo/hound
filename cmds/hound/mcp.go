@@ -30,9 +30,10 @@ type GetExcludesInput struct {
 	Repo string `json:"repo"`
 }
 
-func main() {
-	addr := flag.String("hound-addr", "", "Address of the Hound server (default: http://localhost:6080)")
-	flag.Parse()
+func runMCP(args []string) {
+	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+	addr := fs.String("hound-addr", "", "Address of the Hound server (default: http://localhost:6080)")
+	fs.Parse(args)
 
 	houndAddr := *addr
 	if houndAddr == "" {
