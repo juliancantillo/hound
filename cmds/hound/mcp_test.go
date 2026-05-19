@@ -407,6 +407,187 @@ func TestDoSearch_TokenBudget_TruncatesLargeRawResponse(t *testing.T) {
 	}
 }
 
+func TestDoSearch_FilesOnly_StripsCommonRootPrefix(t *testing.T) {
+	hound := `{
+		"Results": {
+			"r": {
+				"Matches": [
+					{"Filename": "cmd/hound/mcp.go", "Matches": [{"Line":"a","LineNumber":1,"Before":[],"After":[]}]},
+					{"Filename": "cmd/hound/mcp_test.go", "Matches": [{"Line":"b","LineNumber":2,"Before":[],"After":[]}]},
+					{"Filename": "cmd/hound/main.go", "Matches": [{"Line":"c","LineNumber":3,"Before":[],"After":[]}]}
+				],
+				"FilesWithMatch": 3
+			}
+		}
+	}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Root  string `json:"root"`
+		Files []struct {
+			Path string `json:"path"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	if got.Root != "cmd/hound/" {
+		t.Errorf("root = %q, want %q\nbody: %s", got.Root, "cmd/hound/", out)
+	}
+	wantPaths := map[string]bool{"mcp.go": true, "mcp_test.go": true, "main.go": true}
+	for _, f := range got.Files {
+		if !wantPaths[f.Path] {
+			t.Errorf("unexpected path %q after root-stripping (want one of mcp.go/mcp_test.go/main.go)", f.Path)
+		}
+	}
+}
+
+func TestDoSearch_FilesOnly_NoCommonPrefix_OmitsRoot(t *testing.T) {
+	hound := `{
+		"Results": {
+			"r": {
+				"Matches": [
+					{"Filename": "alpha/x.go", "Matches": [{"Line":"a","LineNumber":1,"Before":[],"After":[]}]},
+					{"Filename": "beta/y.go", "Matches": [{"Line":"b","LineNumber":2,"Before":[],"After":[]}]}
+				],
+				"FilesWithMatch": 2
+			}
+		}
+	}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v, ok := got["root"]; ok && string(v) != `""` {
+		t.Errorf("expected no root key (or empty) when no common prefix, got root=%s", v)
+	}
+}
+
+func TestDoSearch_FilesOnly_SingleRepoLiftsRepoToTopLevel(t *testing.T) {
+	hound := `{
+		"Results": {
+			"only-repo": {
+				"Matches": [
+					{"Filename": "alpha/x.go", "Matches": [{"Line":"a","LineNumber":1,"Before":[],"After":[]}]},
+					{"Filename": "beta/y.go", "Matches": [{"Line":"b","LineNumber":2,"Before":[],"After":[]}]}
+				],
+				"FilesWithMatch": 2
+			}
+		}
+	}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Repo  string `json:"repo"`
+		Files []struct {
+			Repo string `json:"repo,omitempty"`
+			Path string `json:"path"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Repo != "only-repo" {
+		t.Errorf("top-level repo = %q, want only-repo\nbody: %s", got.Repo, out)
+	}
+	for _, f := range got.Files {
+		if f.Repo != "" {
+			t.Errorf("per-file repo should be empty when lifted, got %q", f.Repo)
+		}
+	}
+}
+
+func TestDoSearch_FilesOnly_MultiRepoKeepsRepoPerEntry(t *testing.T) {
+	hound := `{
+		"Results": {
+			"repoA": {"Matches": [{"Filename": "a.go", "Matches": [{"Line":"x","LineNumber":1,"Before":[],"After":[]}]}], "FilesWithMatch": 1},
+			"repoB": {"Matches": [{"Filename": "b.go", "Matches": [{"Line":"y","LineNumber":2,"Before":[],"After":[]}]}], "FilesWithMatch": 1}
+		}
+	}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Repo  string `json:"repo"`
+		Files []struct {
+			Repo string `json:"repo"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Repo != "" {
+		t.Errorf("multi-repo response should not lift repo, got %q", got.Repo)
+	}
+	for _, f := range got.Files {
+		if f.Repo == "" {
+			t.Errorf("multi-repo response should keep repo on each entry")
+		}
+	}
+}
+
+func TestDoSearch_FilesOnly_CommonPrefixOnlyStripsOnSeparatorBoundary(t *testing.T) {
+	// Paths share the literal prefix "cmd/houn" but the boundary must respect
+	// the path separator — otherwise we'd hand back broken relative paths.
+	hound := `{
+		"Results": {
+			"r": {
+				"Matches": [
+					{"Filename": "cmd/hound/mcp.go", "Matches": [{"Line":"a","LineNumber":1,"Before":[],"After":[]}]},
+					{"Filename": "cmd/houndd/main.go", "Matches": [{"Line":"b","LineNumber":2,"Before":[],"After":[]}]}
+				],
+				"FilesWithMatch": 2
+			}
+		}
+	}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Root  string `json:"root"`
+		Files []struct {
+			Path string `json:"path"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Root != "cmd/" {
+		t.Errorf("root should fall on a / boundary, got %q (want cmd/)\nbody: %s", got.Root, out)
+	}
+	// Each path must still begin AFTER the boundary, i.e., houn(d|dd)/...
+	for _, f := range got.Files {
+		if strings.HasPrefix(f.Path, "/") {
+			t.Errorf("path should not start with /, got %q", f.Path)
+		}
+	}
+}
+
 func containsAny(s string, subs ...string) bool {
 	for _, sub := range subs {
 		for i := 0; i+len(sub) <= len(s); i++ {

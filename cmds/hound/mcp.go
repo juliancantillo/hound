@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
@@ -143,16 +144,45 @@ type houndResponse struct {
 }
 
 type fileEntry struct {
-	Repo    string `json:"repo"`
+	Repo    string `json:"repo,omitempty"`
 	Path    string `json:"path"`
 	Matches int    `json:"matches"`
 }
 
 type filesOnlyResponse struct {
 	FilesOnly  bool        `json:"files_only"`
+	Repo       string      `json:"repo,omitempty"`
+	Root       string      `json:"root,omitempty"`
 	Files      []fileEntry `json:"files"`
 	Truncated  bool        `json:"truncated"`
 	NextOffset int         `json:"next_offset,omitempty"`
+}
+
+// commonPathPrefix returns the longest path-segment-aligned prefix shared by
+// all input paths. "Path-segment-aligned" means the returned prefix ends at a
+// '/' boundary, so stripping it never produces broken-looking sub-paths.
+// Returns "" if there is no common prefix or only one path.
+func commonPathPrefix(paths []string) string {
+	if len(paths) < 2 {
+		return ""
+	}
+	pfx := paths[0]
+	for _, p := range paths[1:] {
+		n := 0
+		for n < len(pfx) && n < len(p) && pfx[n] == p[n] {
+			n++
+		}
+		pfx = pfx[:n]
+		if pfx == "" {
+			return ""
+		}
+	}
+	// Truncate to the last '/' so we don't split a path segment.
+	i := strings.LastIndex(pfx, "/")
+	if i < 0 {
+		return ""
+	}
+	return pfx[:i+1]
 }
 
 func toFilesOnly(raw json.RawMessage, budget, offset int) (json.RawMessage, error) {
@@ -187,14 +217,18 @@ func toFilesOnly(raw json.RawMessage, budget, offset int) (json.RawMessage, erro
 	windowed := all[offset:]
 
 	out := filesOnlyResponse{FilesOnly: true, Files: []fileEntry{}}
+	compactFilesOnly(&out, windowed)
 	if budget <= 0 {
 		// budget=0 disables truncation entirely.
-		out.Files = windowed
 		return json.Marshal(out)
 	}
 
+	// At this point compactFilesOnly has already populated out.Files with the
+	// compacted (root-stripped, repo-lifted) entries.
+	compactEntries := out.Files
+	out.Files = []fileEntry{}
 	budgetBytes := budget * bytesPerToken
-	for i, f := range windowed {
+	for i, f := range compactEntries {
 		out.Files = append(out.Files, f)
 		size, err := approxJSONSize(out)
 		if err != nil {
@@ -210,6 +244,56 @@ func toFilesOnly(raw json.RawMessage, budget, offset int) (json.RawMessage, erro
 	}
 
 	return json.Marshal(out)
+}
+
+// compactFilesOnly populates out.Files from the given entries while applying
+// two token-saving rewrites:
+//   - if every entry comes from the same repo, lift the repo name to the
+//     top-level out.Repo and clear it on each entry;
+//   - if every entry's path shares a common '/'-aligned prefix, strip it and
+//     report it as out.Root.
+//
+// Entries are expected to be already sorted (by repo then path) so callers
+// can rely on stable output.
+func compactFilesOnly(out *filesOnlyResponse, entries []fileEntry) {
+	if len(entries) == 0 {
+		out.Files = []fileEntry{}
+		return
+	}
+
+	// Single-repo lift.
+	singleRepo := entries[0].Repo
+	for _, e := range entries[1:] {
+		if e.Repo != singleRepo {
+			singleRepo = ""
+			break
+		}
+	}
+	if singleRepo != "" {
+		out.Repo = singleRepo
+	}
+
+	// Common-path-prefix strip.
+	paths := make([]string, len(entries))
+	for i, e := range entries {
+		paths[i] = e.Path
+	}
+	root := commonPathPrefix(paths)
+	if root != "" {
+		out.Root = root
+	}
+
+	out.Files = make([]fileEntry, 0, len(entries))
+	for _, e := range entries {
+		c := e
+		if singleRepo != "" {
+			c.Repo = ""
+		}
+		if root != "" {
+			c.Path = strings.TrimPrefix(c.Path, root)
+		}
+		out.Files = append(out.Files, c)
+	}
 }
 
 // approxJSONSize returns the JSON-encoded length of v. Used to gauge whether
