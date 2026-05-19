@@ -639,6 +639,25 @@ func runMCP(args []string) {
 		},
 	)
 
+	// Log the registered tool names so we can see exactly what gets exposed
+	// over MCP. genkit's own "MCP Server setup complete tools=N" line counts
+	// raw registry actions, which is misleading because genkit's DefineTool
+	// registers each tool under TWO action keys (tool/<name> and
+	// tool-v2/<name>) for backward compatibility. We de-duplicate here so
+	// the number you read matches the tools exposed over MCP.
+	seen := map[string]bool{}
+	toolNames := []string{}
+	for _, t := range genkit.ListTools(g) {
+		n := t.Definition().Name
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		toolNames = append(toolNames, n)
+	}
+	sort.Strings(toolNames)
+	logger.Printf("registered %d tools: %s", len(toolNames), strings.Join(toolNames, ", "))
+
 	s := mcp.NewMCPServer(g, mcp.MCPServerOptions{
 		Name:    "hound-mcp",
 		Version: "1.0.0",
