@@ -4,8 +4,20 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+// newCapturingHoundServer returns a test server that records the most recent
+// upstream query string in *captured and replies with the given JSON body.
+func newCapturingHoundServer(t *testing.T, body string, captured *string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*captured = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+}
 
 // newFakeHoundServer returns an httptest server that responds to any request
 // with the given JSON body. Tests that need per-route behaviour can pass a
@@ -156,6 +168,33 @@ func TestDoSearch_FilesOnly_MultiRepo(t *testing.T) {
 	}
 	if repos["repoA"] != 1 || repos["repoB"] != 2 {
 		t.Errorf("repos = %+v; want {repoA:1, repoB:2}", repos)
+	}
+}
+
+func TestDoSearch_DefaultContext_IsZero(t *testing.T) {
+	var captured string
+	server := newCapturingHoundServer(t, `{"Results":{}}`, &captured)
+	defer server.Close()
+
+	if _, err := doSearch(server.URL, SearchInput{Query: "foo"}); err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	if !strings.Contains(captured, "ctx=0") {
+		t.Errorf("expected ctx=0 in upstream query when Context omitted, got: %q", captured)
+	}
+}
+
+func TestDoSearch_ExplicitContext_PassedThrough(t *testing.T) {
+	var captured string
+	server := newCapturingHoundServer(t, `{"Results":{}}`, &captured)
+	defer server.Close()
+
+	ctx := 4
+	if _, err := doSearch(server.URL, SearchInput{Query: "foo", Context: &ctx}); err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	if !strings.Contains(captured, "ctx=4") {
+		t.Errorf("expected ctx=4 in upstream query when Context explicit, got: %q", captured)
 	}
 }
 

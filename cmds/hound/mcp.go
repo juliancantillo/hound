@@ -23,7 +23,7 @@ type SearchInput struct {
 	ExcludeFiles string `json:"excludeFiles,omitempty"`
 	IgnoreCase   bool   `json:"ignoreCase,omitempty"`
 	Literal      bool   `json:"literal,omitempty"`
-	Context      *int   `json:"context,omitempty"`
+	Context      *int   `json:"context,omitempty" jsonschema_description:"Number of context lines to include before and after each match. Default 0 (match line only); pass an explicit value (e.g., 2) when you actually need surrounding code."`
 	Limit        *int   `json:"limit,omitempty"`
 	FilesOnly    bool   `json:"files_only,omitempty"`
 }
@@ -54,9 +54,14 @@ func doSearch(houndAddr string, input SearchInput) (json.RawMessage, error) {
 	if input.Literal {
 		params += "&literal=true"
 	}
+	// Default context to 0 on the wrapper side so LLM callers get compact
+	// match-only output without paying for surrounding lines they rarely use.
+	// Callers can still opt back into surrounding context with an explicit value.
+	ctxLines := 0
 	if input.Context != nil {
-		params += fmt.Sprintf("&ctx=%d", *input.Context)
+		ctxLines = *input.Context
 	}
+	params += fmt.Sprintf("&ctx=%d", ctxLines)
 	if input.Limit != nil {
 		params += fmt.Sprintf("&limit=%d", *input.Limit)
 	}
