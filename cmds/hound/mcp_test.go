@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -227,6 +228,182 @@ func TestDoSearch_ExplicitContext_PassedThrough(t *testing.T) {
 	}
 	if !strings.Contains(captured, "ctx=4") {
 		t.Errorf("expected ctx=4 in upstream query when Context explicit, got: %q", captured)
+	}
+}
+
+// makeFilesOnlyHoundResponse returns a hound response with n files in a single
+// repo, each with one match. Useful for sizing the response in budget tests.
+func makeFilesOnlyHoundResponse(n int) string {
+	var b strings.Builder
+	b.WriteString(`{"Results":{"r":{"Matches":[`)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		// Each entry includes a moderately long path so size is meaningful.
+		fmt.Fprintf(&b, `{"Filename":"deeply/nested/directory/structure/file_with_long_name_%04d.go","Matches":[{"Line":"hit","LineNumber":1,"Before":[],"After":[]}]}`, i)
+	}
+	b.WriteString(`],"FilesWithMatch":`)
+	fmt.Fprintf(&b, `%d}}}`, n)
+	return b.String()
+}
+
+func TestDoSearch_TokenBudget_PassesThroughSmallResponse(t *testing.T) {
+	hound := `{"Results":{"r":{"Matches":[{"Filename":"x.go","Matches":[{"Line":"foo","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1}}}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	budget := 2000
+	out, err := doSearch(server.URL, SearchInput{Query: "foo", MaxResponseTokens: &budget})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	// Tiny response should pass through verbatim — no truncated/next_offset keys.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(out, &top); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := top["truncated"]; ok {
+		t.Errorf("did not expect truncated key for small response: %s", out)
+	}
+}
+
+func TestDoSearch_TokenBudget_TruncatesLargeFilesOnlyResponse(t *testing.T) {
+	hound := makeFilesOnlyHoundResponse(200)
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	// 200 files × ~80 bytes per files-only entry ~ 16k bytes ~ 4000 tokens.
+	// Set budget to 200 tokens (~800 bytes) so truncation must kick in.
+	budget := 200
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true, MaxResponseTokens: &budget})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+
+	var got struct {
+		Files []struct {
+			Path string `json:"path"`
+		} `json:"files"`
+		Truncated  bool `json:"truncated"`
+		NextOffset int  `json:"next_offset"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	if !got.Truncated {
+		t.Errorf("expected truncated=true with budget=%d, got %d files in %d bytes", budget, len(got.Files), len(out))
+	}
+	if len(got.Files) >= 200 {
+		t.Errorf("expected fewer than 200 files after truncation, got %d", len(got.Files))
+	}
+	if got.NextOffset != len(got.Files) {
+		t.Errorf("next_offset = %d, want %d (number of files included)", got.NextOffset, len(got.Files))
+	}
+	if len(out) > budget*8 {
+		// Allow generous slack since the budget is approximate (bytes ≈ 4 tokens).
+		t.Errorf("output %d bytes exceeded budget*8 (%d) — truncation too lax", len(out), budget*8)
+	}
+}
+
+func TestDoSearch_TokenBudget_FilesOnlyOffsetSkipsFiles(t *testing.T) {
+	hound := makeFilesOnlyHoundResponse(50)
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	offset := 10
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true, Offset: &offset})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Files []struct {
+			Path string `json:"path"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Files) != 40 {
+		t.Errorf("got %d files after offset=10, want 40", len(got.Files))
+	}
+	// First file in the sorted list with offset=10 should be ..._0010.go
+	if len(got.Files) > 0 && !strings.Contains(got.Files[0].Path, "_0010.go") {
+		t.Errorf("after offset=10, expected first file to be _0010.go, got %q", got.Files[0].Path)
+	}
+}
+
+func TestDoSearch_TokenBudget_ZeroMeansUnlimited(t *testing.T) {
+	hound := makeFilesOnlyHoundResponse(100)
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	budget := 0 // explicit opt-out of budgeting
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true, MaxResponseTokens: &budget})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Files     []json.RawMessage `json:"files"`
+		Truncated bool              `json:"truncated"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Truncated {
+		t.Errorf("budget=0 should mean unlimited; expected truncated=false")
+	}
+	if len(got.Files) != 100 {
+		t.Errorf("expected all 100 files with budget=0, got %d", len(got.Files))
+	}
+}
+
+func TestDoSearch_TokenBudget_TruncatesLargeRawResponse(t *testing.T) {
+	// Build a hound response with 20 files each containing 30 matches with
+	// substantial body content, so the raw response is well over 2000 tokens.
+	var b strings.Builder
+	b.WriteString(`{"Results":{"r":{"Matches":[`)
+	for i := 0; i < 20; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"Filename":"file_%02d.go","Matches":[`, i)
+		for j := 0; j < 30; j++ {
+			if j > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"Line":"some moderately long matching line of code that costs tokens %d","LineNumber":%d,"Before":[],"After":[]}`, j, j)
+		}
+		b.WriteString(`]}`)
+	}
+	b.WriteString(`],"FilesWithMatch":20}}}`)
+	hound := b.String()
+
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	budget := 500
+	out, err := doSearch(server.URL, SearchInput{Query: "x", MaxResponseTokens: &budget})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+
+	var got struct {
+		Results    map[string]json.RawMessage `json:"Results"`
+		Truncated  bool                       `json:"truncated"`
+		NextOffset int                        `json:"next_offset"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	if !got.Truncated {
+		t.Errorf("expected truncated=true on oversized raw response (%d bytes)", len(out))
+	}
+	if got.NextOffset <= 0 {
+		t.Errorf("expected next_offset > 0, got %d", got.NextOffset)
+	}
+	if len(out) > budget*8 {
+		t.Errorf("output %d bytes greatly exceeded budget*8 = %d", len(out), budget*8)
 	}
 }
 
