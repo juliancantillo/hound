@@ -1,21 +1,31 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
 	"github.com/firebase/genkit/go/plugins/mcp"
 )
+
+// logger is the package-level logger used by every tool handler. It writes to
+// stderr by default, which is the only stream MCP-over-stdio leaves free for
+// non-protocol output. Tests swap it out via captureLogs. Pass --log-file at
+// startup to redirect it to a file instead — useful because Claude Code
+// usually swallows the stderr of MCP servers it launches.
+var logger = log.New(os.Stderr, "[hound-mcp] ", log.LstdFlags|log.Lmicroseconds)
 
 type SearchInput struct {
 	Query        string `json:"query" jsonschema_description:"Pattern to search for. Treated as an RE2 regular expression unless 'literal' is true. Examples: 'func\\s+Setup\\(', 'TODO\\(\\w+\\)', 'NewServer'."`
@@ -54,6 +64,21 @@ Narrow noisy queries with 'repos', 'files', and 'excludeFiles' before lowering '
 const getExcludesDescription = "List the file patterns that Hound excluded from indexing for a given repository. Use this to explain why an expected file or directory is missing from 'search' results, or to confirm whether a path is searchable at all before running queries."
 
 func doSearch(houndAddr string, input SearchInput) (json.RawMessage, error) {
+	start := time.Now()
+	out, err := doSearchInner(houndAddr, input)
+	dur := time.Since(start)
+	if err != nil {
+		logger.Printf("search query=%q files_only=%v kind=%q ERROR in %s: %v",
+			input.Query, input.FilesOnly, input.Kind, dur, err)
+		return nil, err
+	}
+	truncated := bytes.Contains(out, []byte(`"truncated":true`))
+	logger.Printf("search query=%q files_only=%v kind=%q → %d bytes in %s truncated=%v",
+		input.Query, input.FilesOnly, input.Kind, len(out), dur, truncated)
+	return out, nil
+}
+
+func doSearchInner(houndAddr string, input SearchInput) (json.RawMessage, error) {
 	repos := input.Repos
 	if repos == "" {
 		repos = "*"
@@ -562,6 +587,7 @@ func applyTokenBudget(raw json.RawMessage, budget, offset int) (json.RawMessage,
 func runMCP(args []string) {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	addr := fs.String("hound-addr", "", "Address of the Hound server (default: http://localhost:6080)")
+	logFile := fs.String("log-file", "", "Path to write tool-call logs. Defaults to stderr (often invisible when launched as an MCP server). HOUND_MCP_LOG_FILE env var is used if this flag is empty.")
 	fs.Parse(args)
 
 	houndAddr := *addr
@@ -572,23 +598,30 @@ func runMCP(args []string) {
 		houndAddr = "http://localhost:6080"
 	}
 
+	logPath := *logFile
+	if logPath == "" {
+		logPath = os.Getenv("HOUND_MCP_LOG_FILE")
+	}
+	if logPath != "" {
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			// We can't log this failure to the file we just failed to open;
+			// fall back to stderr and keep going so the server still runs.
+			fmt.Fprintf(os.Stderr, "[hound-mcp] failed to open log file %s: %v; logging to stderr\n", logPath, err)
+		} else {
+			logger.SetOutput(io.MultiWriter(os.Stderr, f))
+		}
+	}
+
+	logger.Printf("starting hound-mcp pid=%d hound_addr=%s log_file=%q", os.Getpid(), houndAddr, logPath)
+
 	ctx := context.Background()
 	g := genkit.Init(ctx)
 
 	genkit.DefineTool(g, "list_repos",
 		listReposDescription,
 		func(ctx *ai.ToolContext, _ struct{}) (json.RawMessage, error) {
-			resp, err := http.Get(fmt.Sprintf("%s/api/v1/repos", houndAddr))
-			if err != nil {
-				return nil, fmt.Errorf("failed to connect to Hound server at %s: %w", houndAddr, err)
-			}
-			defer resp.Body.Close()
-
-			var result json.RawMessage
-			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-				return nil, fmt.Errorf("failed to decode response: %w", err)
-			}
-			return result, nil
+			return doListRepos(houndAddr)
 		},
 	)
 
@@ -602,18 +635,7 @@ func runMCP(args []string) {
 	genkit.DefineTool(g, "get_excludes",
 		getExcludesDescription,
 		func(ctx *ai.ToolContext, input GetExcludesInput) (json.RawMessage, error) {
-			resp, err := http.Get(fmt.Sprintf("%s/api/v1/excludes?repo=%s",
-				houndAddr, url.QueryEscape(input.Repo)))
-			if err != nil {
-				return nil, fmt.Errorf("failed to connect to Hound server at %s: %w", houndAddr, err)
-			}
-			defer resp.Body.Close()
-
-			var result json.RawMessage
-			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-				return nil, fmt.Errorf("failed to decode response: %w", err)
-			}
-			return result, nil
+			return doGetExcludes(houndAddr, input)
 		},
 	)
 
@@ -625,4 +647,44 @@ func runMCP(args []string) {
 	if err := s.ServeStdio(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func doListRepos(houndAddr string) (json.RawMessage, error) {
+	start := time.Now()
+	resp, err := http.Get(fmt.Sprintf("%s/api/v1/repos", houndAddr))
+	if err != nil {
+		logger.Printf("list_repos ERROR in %s: %v", time.Since(start), err)
+		return nil, fmt.Errorf("failed to connect to Hound server at %s: %w", houndAddr, err)
+	}
+	defer resp.Body.Close()
+
+	var result json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		logger.Printf("list_repos ERROR in %s: %v", time.Since(start), err)
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	// Count keys at the top level — cheaper than fully parsing.
+	var asMap map[string]json.RawMessage
+	_ = json.Unmarshal(result, &asMap)
+	logger.Printf("list_repos → %d repos / %d bytes in %s", len(asMap), len(result), time.Since(start))
+	return result, nil
+}
+
+func doGetExcludes(houndAddr string, input GetExcludesInput) (json.RawMessage, error) {
+	start := time.Now()
+	resp, err := http.Get(fmt.Sprintf("%s/api/v1/excludes?repo=%s",
+		houndAddr, url.QueryEscape(input.Repo)))
+	if err != nil {
+		logger.Printf("get_excludes repo=%q ERROR in %s: %v", input.Repo, time.Since(start), err)
+		return nil, fmt.Errorf("failed to connect to Hound server at %s: %w", houndAddr, err)
+	}
+	defer resp.Body.Close()
+
+	var result json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		logger.Printf("get_excludes repo=%q ERROR in %s: %v", input.Repo, time.Since(start), err)
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	logger.Printf("get_excludes repo=%q → %d bytes in %s", input.Repo, len(result), time.Since(start))
+	return result, nil
 }

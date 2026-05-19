@@ -1,14 +1,25 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 )
+
+// TestMain silences the package logger so tests don't spam stderr. Tests that
+// specifically want to inspect log output call captureLogs to swap in a buffer.
+func TestMain(m *testing.M) {
+	logger = log.New(io.Discard, "", 0)
+	os.Exit(m.Run())
+}
 
 // newCapturingHoundServer returns a test server that records the most recent
 // upstream query string in *captured and replies with the given JSON body.
@@ -652,6 +663,78 @@ func TestDoSearch_SymbolKind_SendsORRegexOfVariants(t *testing.T) {
 	}
 	if !strings.Contains(decoded, `\b`) {
 		t.Errorf("symbol mode should anchor each variant with \\b; query: %s", decoded)
+	}
+}
+
+// captureLogs swaps the package-level logger to a buffer for the duration of
+// a test and returns the buffer plus a restore func. The MCP server normally
+// writes to stderr; tests don't want that.
+func captureLogs(t *testing.T) (*bytes.Buffer, func()) {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	prev := logger
+	logger = log.New(buf, "", 0)
+	return buf, func() { logger = prev }
+}
+
+func TestDoSearch_LogsToolCallSummary(t *testing.T) {
+	buf, restore := captureLogs(t)
+	defer restore()
+
+	server := newFakeHoundServer(t, `{"Results":{"r":{"Matches":[{"Filename":"x.go","Matches":[{"Line":"hit","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1}}}`)
+	defer server.Close()
+
+	if _, err := doSearch(server.URL, SearchInput{Query: "needle", FilesOnly: true}); err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+
+	out := buf.String()
+	want := []string{
+		"search",   // tool name
+		"needle",   // query echoed
+		"files_only", // mode flag visible
+		"bytes",    // response size mentioned
+	}
+	for _, w := range want {
+		if !strings.Contains(out, w) {
+			t.Errorf("log missing %q\nfull log:\n%s", w, out)
+		}
+	}
+}
+
+func TestDoSearch_LogsErrorWhenHoundUnreachable(t *testing.T) {
+	buf, restore := captureLogs(t)
+	defer restore()
+
+	// Point at a closed server.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close()
+
+	_, err := doSearch(srv.URL, SearchInput{Query: "x"})
+	if err == nil {
+		t.Fatalf("expected error talking to a closed server")
+	}
+	if !strings.Contains(buf.String(), "ERROR") && !strings.Contains(buf.String(), "error") {
+		t.Errorf("expected the log to mention the error; got: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "search") {
+		t.Errorf("expected the log to mention the tool name; got: %s", buf.String())
+	}
+}
+
+func TestDoSearch_LogIncludesTruncationFlag(t *testing.T) {
+	buf, restore := captureLogs(t)
+	defer restore()
+
+	hound := makeFilesOnlyHoundResponse(200)
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+	budget := 200
+	if _, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true, MaxResponseTokens: &budget}); err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	if !strings.Contains(buf.String(), "truncated=true") {
+		t.Errorf("expected log to flag truncation; got: %s", buf.String())
 	}
 }
 
