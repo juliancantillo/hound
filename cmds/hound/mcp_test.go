@@ -184,6 +184,38 @@ func TestDoSearch_DefaultContext_IsZero(t *testing.T) {
 	}
 }
 
+func TestSearchToolDescription_MentionsFilesOnlyAndExcludePatterns(t *testing.T) {
+	// The tool description is what a model sees first when picking a tool.
+	// It must teach the cheap idioms: prefer files_only for discovery,
+	// and use excludeFiles to filter out generated/vendor noise.
+	want := []string{
+		"files_only",        // recommended discovery mode
+		"Read",              // pairs with Read for drill-down
+		"excludeFiles",      // common-pattern hint
+		"_test",             // a representative exclusion pattern
+		"vendor",            // another representative exclusion pattern
+		"RE2",               // tells the model about regex flavour
+	}
+	for _, sub := range want {
+		if !strings.Contains(searchToolDescription, sub) {
+			t.Errorf("searchToolDescription missing required keyword %q", sub)
+		}
+	}
+}
+
+func TestListReposDescription_MentionsDiscoveryFlow(t *testing.T) {
+	if !strings.Contains(listReposDescription, "search") {
+		t.Errorf("listReposDescription should point at the search tool, got: %q", listReposDescription)
+	}
+}
+
+func TestGetExcludesDescription_ExplainsPurpose(t *testing.T) {
+	if !strings.Contains(getExcludesDescription, "excluded") &&
+		!strings.Contains(getExcludesDescription, "indexing") {
+		t.Errorf("getExcludesDescription should explain its purpose, got: %q", getExcludesDescription)
+	}
+}
+
 func TestDoSearch_ExplicitContext_PassedThrough(t *testing.T) {
 	var captured string
 	server := newCapturingHoundServer(t, `{"Results":{}}`, &captured)

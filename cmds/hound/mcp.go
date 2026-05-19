@@ -17,20 +17,35 @@ import (
 )
 
 type SearchInput struct {
-	Query        string `json:"query"`
-	Repos        string `json:"repos,omitempty"`
-	Files        string `json:"files,omitempty"`
-	ExcludeFiles string `json:"excludeFiles,omitempty"`
-	IgnoreCase   bool   `json:"ignoreCase,omitempty"`
-	Literal      bool   `json:"literal,omitempty"`
-	Context      *int   `json:"context,omitempty" jsonschema_description:"Number of context lines to include before and after each match. Default 0 (match line only); pass an explicit value (e.g., 2) when you actually need surrounding code."`
-	Limit        *int   `json:"limit,omitempty"`
-	FilesOnly    bool   `json:"files_only,omitempty"`
+	Query        string `json:"query" jsonschema_description:"Pattern to search for. Treated as an RE2 regular expression unless 'literal' is true. Examples: 'func\\s+Setup\\(', 'TODO\\(\\w+\\)', 'NewServer'."`
+	Repos        string `json:"repos,omitempty" jsonschema_description:"Comma-separated list of repository names (as returned by list_repos) to restrict the search to. Use '*' or omit to search every indexed repository."`
+	Files        string `json:"files,omitempty" jsonschema_description:"RE2 regex matched against file paths to include. Example: '\\.go$' restricts results to Go files; 'cmd/.*\\.go$' restricts to Go files under cmd/."`
+	ExcludeFiles string `json:"excludeFiles,omitempty" jsonschema_description:"RE2 regex matched against file paths to exclude. Common patterns: '_test\\.go$' (Go tests), '\\.pb\\.go$' or '\\.pb\\.cc$' (generated protobuf), '_mock' or '_mocks?\\.' (generated mocks), 'vendor/' or 'node_modules/' (third-party), 'dist/' or 'build/' (build artifacts)."`
+	IgnoreCase   bool   `json:"ignoreCase,omitempty" jsonschema_description:"If true the pattern matches case-insensitively. Defaults to false (case-sensitive)."`
+	Literal      bool   `json:"literal,omitempty" jsonschema_description:"If true the query is treated as a literal string rather than a regex. Use this when searching for code containing regex metacharacters such as '.', '(' or '*'."`
+	Context      *int   `json:"context,omitempty" jsonschema_description:"Number of context lines to include before and after each match. Default 0 (match line only); pass an explicit value (e.g., 2) when you actually need surrounding code. Clamped to a maximum of 20."`
+	Limit        *int   `json:"limit,omitempty" jsonschema_description:"Maximum number of matches returned per repository. Lower this when a broad query would otherwise return very large results."`
+	FilesOnly    bool   `json:"files_only,omitempty" jsonschema_description:"If true, return only the list of matching file paths with a per-file match count and no match bodies — analogous to 'rg -l'. Use for first-pass discovery, then read specific files with Read."`
 }
 
 type GetExcludesInput struct {
-	Repo string `json:"repo"`
+	Repo string `json:"repo" jsonschema_description:"Repository name to inspect. Must match one of the names returned by list_repos."`
 }
+
+const listReposDescription = "List every source-code repository indexed by this Hound server, keyed by repository name. Call this first to discover which repos exist and to pick names for the 'repos' parameter of the 'search' tool."
+
+const searchToolDescription = `Search the source code of one or more indexed repositories for an RE2 regex (or a literal string when 'literal' is true). This is text matching, not semantic search.
+
+For first-pass discovery prefer 'files_only': true — this returns just the matching file paths with per-file counts (analogous to 'rg -l') and is typically 5–10x cheaper than the default match-body output. Only switch to match-body mode when you actually need to read the hits inline and Read on the file is not a better choice.
+
+Typical workflow:
+  1. search({query: "NewServer", files_only: true})
+  2. → pick the most relevant path from the result
+  3. Read that file (and use search with a tighter regex if you need cross-file follow-ups)
+
+Narrow noisy queries with 'repos', 'files', and 'excludeFiles' before lowering 'limit'. Common excludeFiles patterns: '_test\.go$', '\.pb\.go$', '_mock', 'vendor/', 'node_modules/', 'dist/'.`
+
+const getExcludesDescription = "List the file patterns that Hound excluded from indexing for a given repository. Use this to explain why an expected file or directory is missing from 'search' results, or to confirm whether a path is searchable at all before running queries."
 
 func doSearch(houndAddr string, input SearchInput) (json.RawMessage, error) {
 	repos := input.Repos
@@ -164,7 +179,7 @@ func runMCP(args []string) {
 	g := genkit.Init(ctx)
 
 	genkit.DefineTool(g, "list_repos",
-		"List all available source code repositories indexed by Hound",
+		listReposDescription,
 		func(ctx *ai.ToolContext, _ struct{}) (json.RawMessage, error) {
 			resp, err := http.Get(fmt.Sprintf("%s/api/v1/repos", houndAddr))
 			if err != nil {
@@ -181,14 +196,14 @@ func runMCP(args []string) {
 	)
 
 	genkit.DefineTool(g, "search",
-		"Search across source code repositories using regex or literal patterns. Returns matches with file paths, line numbers, and context lines. Set 'files_only' to true to skip match bodies and return only the list of matching file paths with per-file counts — cheap for first-pass discovery before drilling into specific files with Read.",
+		searchToolDescription,
 		func(ctx *ai.ToolContext, input SearchInput) (json.RawMessage, error) {
 			return doSearch(houndAddr, input)
 		},
 	)
 
 	genkit.DefineTool(g, "get_excludes",
-		"Get the list of excluded file patterns for a repository",
+		getExcludesDescription,
 		func(ctx *ai.ToolContext, input GetExcludesInput) (json.RawMessage, error) {
 			resp, err := http.Get(fmt.Sprintf("%s/api/v1/excludes?repo=%s",
 				houndAddr, url.QueryEscape(input.Repo)))
