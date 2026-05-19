@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -585,6 +586,72 @@ func TestDoSearch_FilesOnly_CommonPrefixOnlyStripsOnSeparatorBoundary(t *testing
 		if strings.HasPrefix(f.Path, "/") {
 			t.Errorf("path should not start with /, got %q", f.Path)
 		}
+	}
+}
+
+func TestSymbolVariants(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"validateComputeMetric", []string{"validateComputeMetric", "ValidateComputeMetric", "validate_compute_metric"}},
+		{"ValidateComputeMetric", []string{"validateComputeMetric", "ValidateComputeMetric", "validate_compute_metric"}},
+		{"validate_compute_metric", []string{"validateComputeMetric", "ValidateComputeMetric", "validate_compute_metric"}},
+		{"NewServer", []string{"newServer", "NewServer", "new_server"}},
+		// Single-word identifiers: all three variants collapse to two
+		// distinct strings (camel/snake equal, Pascal capitalised).
+		{"server", []string{"server", "Server"}},
+	}
+	for _, c := range cases {
+		got := symbolVariants(c.in)
+		gotSet := map[string]bool{}
+		for _, v := range got {
+			gotSet[v] = true
+		}
+		for _, w := range c.want {
+			if !gotSet[w] {
+				t.Errorf("symbolVariants(%q): missing variant %q (got %v)", c.in, w, got)
+			}
+		}
+		// No duplicates.
+		seen := map[string]bool{}
+		for _, v := range got {
+			if seen[v] {
+				t.Errorf("symbolVariants(%q): duplicate variant %q in %v", c.in, v, got)
+			}
+			seen[v] = true
+		}
+	}
+}
+
+func TestDoSearch_SymbolKind_SendsORRegexOfVariants(t *testing.T) {
+	var captured string
+	server := newCapturingHoundServer(t, `{"Results":{}}`, &captured)
+	defer server.Close()
+
+	_, err := doSearch(server.URL, SearchInput{Query: "newServer", Kind: "symbol"})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+
+	// The upstream query string is URL-encoded. Decode and inspect.
+	decoded, err := url.QueryUnescape(captured)
+	if err != nil {
+		t.Fatalf("decode captured query: %v\n%s", err, captured)
+	}
+	// All three variants should appear in the regex.
+	for _, want := range []string{"newServer", "NewServer", "new_server"} {
+		if !strings.Contains(decoded, want) {
+			t.Errorf("symbol query missing variant %q in upstream query: %s", want, decoded)
+		}
+	}
+	// The wrapper should not also pass literal=true (the regex would lose
+	// alternation semantics) and should add word boundaries to keep noise low.
+	if strings.Contains(decoded, "literal=true") {
+		t.Errorf("symbol mode should not pass literal=true; query: %s", decoded)
+	}
+	if !strings.Contains(decoded, `\b`) {
+		t.Errorf("symbol mode should anchor each variant with \\b; query: %s", decoded)
 	}
 }
 

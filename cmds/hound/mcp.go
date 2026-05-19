@@ -29,6 +29,7 @@ type SearchInput struct {
 	FilesOnly    bool   `json:"files_only,omitempty" jsonschema_description:"If true, return only the list of matching file paths with a per-file match count and no match bodies — analogous to 'rg -l'. Use for first-pass discovery, then read specific files with Read."`
 	MaxResponseTokens *int `json:"max_response_tokens,omitempty" jsonschema_description:"Approximate cap on the response token count (1 token ≈ 4 bytes). Default 2000. When exceeded, files are dropped from the end of the result; the response gains 'truncated': true and 'next_offset' so the caller can paginate via the 'offset' field. Set to 0 to disable the cap."`
 	Offset            *int `json:"offset,omitempty" jsonschema_description:"Number of files to skip from the start of the result set, for paginating responses that were previously truncated. Pair with the 'next_offset' value returned in a prior truncated response."`
+	Kind              string `json:"kind,omitempty" jsonschema_description:"Optional query helper. 'symbol' treats 'query' as an identifier and searches for its case/style variants (camelCase, PascalCase, snake_case) in a single call, with word-boundary anchoring. Default (empty/unset) treats 'query' as an RE2 regex (or literal when 'literal' is true)."`
 }
 
 type GetExcludesInput struct {
@@ -40,6 +41,8 @@ const listReposDescription = "List every source-code repository indexed by this 
 const searchToolDescription = `Search the source code of one or more indexed repositories for an RE2 regex (or a literal string when 'literal' is true). This is text matching, not semantic search.
 
 For first-pass discovery prefer 'files_only': true — this returns just the matching file paths with per-file counts (analogous to 'rg -l') and is typically 5–10x cheaper than the default match-body output. Only switch to match-body mode when you actually need to read the hits inline and Read on the file is not a better choice.
+
+If you don't know the casing convention used in the codebase (camelCase vs PascalCase vs snake_case), pass kind: "symbol" with an identifier; the wrapper runs all three variants in one search instead of you probing each.
 
 Typical workflow:
   1. search({query: "NewServer", files_only: true})
@@ -56,8 +59,19 @@ func doSearch(houndAddr string, input SearchInput) (json.RawMessage, error) {
 		repos = "*"
 	}
 
+	query := input.Query
+	literal := input.Literal
+	if input.Kind == "symbol" {
+		// Build an OR-regex of identifier variants, word-anchored, so a single
+		// search covers the cases a model would otherwise probe one-by-one.
+		// Force literal off — literal mode would treat the parentheses and pipes
+		// as literal characters and the alternation would never match.
+		query = symbolQueryRegex(input.Query)
+		literal = false
+	}
+
 	params := fmt.Sprintf("q=%s&repos=%s&stats=true",
-		url.QueryEscape(input.Query),
+		url.QueryEscape(query),
 		url.QueryEscape(repos))
 
 	if input.Files != "" {
@@ -69,7 +83,7 @@ func doSearch(houndAddr string, input SearchInput) (json.RawMessage, error) {
 	if input.IgnoreCase {
 		params += "&i=true"
 	}
-	if input.Literal {
+	if literal {
 		params += "&literal=true"
 	}
 	// Default context to 0 on the wrapper side so LLM callers get compact
@@ -156,6 +170,83 @@ type filesOnlyResponse struct {
 	Files      []fileEntry `json:"files"`
 	Truncated  bool        `json:"truncated"`
 	NextOffset int         `json:"next_offset,omitempty"`
+}
+
+// splitIdentifier breaks an identifier into its word-parts regardless of the
+// casing convention used by the input. Recognises:
+//   - snake_case: split on '_'
+//   - camelCase / PascalCase: split before each uppercase letter that follows
+//     a lowercase letter or digit.
+// Parts are returned lowercased so callers can re-emit in any casing.
+func splitIdentifier(s string) []string {
+	if s == "" {
+		return nil
+	}
+	if strings.Contains(s, "_") {
+		parts := []string{}
+		for _, p := range strings.Split(s, "_") {
+			if p != "" {
+				parts = append(parts, strings.ToLower(p))
+			}
+		}
+		return parts
+	}
+	parts := []string{}
+	start := 0
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		prev := s[i-1]
+		if isUpper(c) && !isUpper(prev) {
+			parts = append(parts, strings.ToLower(s[start:i]))
+			start = i
+		}
+	}
+	parts = append(parts, strings.ToLower(s[start:]))
+	return parts
+}
+
+func isUpper(c byte) bool {
+	return c >= 'A' && c <= 'Z'
+}
+
+// symbolVariants returns the de-duplicated set of casing variants for an
+// identifier — camelCase, PascalCase, snake_case. For a single-word input
+// (e.g. "server"), camel and snake collapse to one entry.
+func symbolVariants(s string) []string {
+	parts := splitIdentifier(s)
+	if len(parts) == 0 {
+		return nil
+	}
+	camel := parts[0]
+	pascal := strings.ToUpper(parts[0][:1]) + parts[0][1:]
+	for _, p := range parts[1:] {
+		camel += strings.ToUpper(p[:1]) + p[1:]
+		pascal += strings.ToUpper(p[:1]) + p[1:]
+	}
+	snake := strings.Join(parts, "_")
+
+	out := []string{}
+	seen := map[string]bool{}
+	for _, v := range []string{camel, pascal, snake} {
+		if !seen[v] {
+			out = append(out, v)
+			seen[v] = true
+		}
+	}
+	return out
+}
+
+// symbolQueryRegex builds the RE2 alternation hound should run for kind=symbol.
+// Each variant is anchored with \b so we don't match inside other identifiers.
+func symbolQueryRegex(s string) string {
+	variants := symbolVariants(s)
+	if len(variants) == 0 {
+		return s
+	}
+	if len(variants) == 1 {
+		return `\b` + variants[0] + `\b`
+	}
+	return `\b(` + strings.Join(variants, "|") + `)\b`
 }
 
 // commonPathPrefix returns the longest path-segment-aligned prefix shared by
