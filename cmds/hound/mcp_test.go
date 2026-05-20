@@ -200,9 +200,11 @@ func TestDoSearch_DefaultContext_IsZero(t *testing.T) {
 func TestSearchToolDescription_MentionsFilesOnlyAndExcludePatterns(t *testing.T) {
 	// The tool description is what a model sees first when picking a tool.
 	// It must teach the cheap idioms: prefer files_only for discovery,
-	// and use excludeFiles to filter out generated/vendor noise.
+	// follow up with lines_only when the file list is too long to read
+	// whole, and use excludeFiles to filter out generated/vendor noise.
 	want := []string{
 		"files_only",        // recommended discovery mode
+		"lines_only",        // middle-fidelity mode for targeted Reads
 		"Read",              // pairs with Read for drill-down
 		"excludeFiles",      // common-pattern hint
 		"_test",             // a representative exclusion pattern
@@ -747,4 +749,284 @@ func containsAny(s string, subs ...string) bool {
 		}
 	}
 	return false
+}
+
+// linesOnlyDecoded is the shape we unmarshal lines_only responses into.
+// Defined here once so multiple tests share the schema.
+type linesOnlyDecoded struct {
+	LinesOnly bool   `json:"lines_only"`
+	Repo      string `json:"repo"`
+	Root      string `json:"root"`
+	Files     []struct {
+		Repo  string `json:"repo"`
+		Path  string `json:"path"`
+		Lines []int  `json:"lines"`
+	} `json:"files"`
+	Truncated  bool `json:"truncated"`
+	NextOffset int  `json:"next_offset"`
+}
+
+func TestDoSearch_LinesOnly_ReturnsLineNumbersOnly(t *testing.T) {
+	hound := `{
+		"Results": {
+			"myrepo": {
+				"Matches": [
+					{"Filename": "pkg/a.go", "Matches": [
+						{"Line": "foo", "LineNumber": 10, "Before": [], "After": []},
+						{"Line": "bar", "LineNumber": 42, "Before": [], "After": []}
+					]},
+					{"Filename": "pkg/b.go", "Matches": [
+						{"Line": "qux", "LineNumber": 7, "Before": [], "After": []}
+					]}
+				],
+				"FilesWithMatch": 2,
+				"Revision": "abc"
+			}
+		}
+	}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "foo", LinesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+
+	var got linesOnlyDecoded
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	if !got.LinesOnly {
+		t.Errorf("lines_only flag not set in response: %s", out)
+	}
+	if len(got.Files) != 2 {
+		t.Fatalf("got %d files, want 2: %+v", len(got.Files), got.Files)
+	}
+
+	// Files come back sorted by repo, then path; with the common-prefix lift
+	// each path is just the basename.
+	byPath := map[string][]int{}
+	for _, f := range got.Files {
+		byPath[f.Path] = f.Lines
+	}
+	if !equalIntSlice(byPath["a.go"], []int{10, 42}) {
+		t.Errorf("a.go lines = %v, want [10 42]", byPath["a.go"])
+	}
+	if !equalIntSlice(byPath["b.go"], []int{7}) {
+		t.Errorf("b.go lines = %v, want [7]", byPath["b.go"])
+	}
+}
+
+func TestDoSearch_LinesOnly_StripsMatchBodies(t *testing.T) {
+	hound := `{"Results":{"r":{"Matches":[{"Filename":"x.go","Matches":[{"Line":"SENSITIVE_LINE_CONTENT","LineNumber":1,"Before":["before-a","before-b"],"After":["after-a","after-b"]}]}],"FilesWithMatch":1}}}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", LinesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	for _, leak := range []string{"SENSITIVE_LINE_CONTENT", "before-a", "after-a"} {
+		if strings.Contains(string(out), leak) {
+			t.Errorf("lines_only response leaked %q: %s", leak, out)
+		}
+	}
+}
+
+func TestDoSearch_LinesOnly_DedupesAndSortsLines(t *testing.T) {
+	// Hound can return duplicate LineNumbers if the same line matches more
+	// than once. lines_only should dedupe and emit ascending order.
+	hound := `{"Results":{"r":{"Matches":[{"Filename":"x.go","Matches":[
+		{"Line":"a","LineNumber":42,"Before":[],"After":[]},
+		{"Line":"b","LineNumber":7,"Before":[],"After":[]},
+		{"Line":"c","LineNumber":42,"Before":[],"After":[]},
+		{"Line":"d","LineNumber":13,"Before":[],"After":[]}
+	]}],"FilesWithMatch":1}}}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", LinesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got linesOnlyDecoded
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(got.Files))
+	}
+	if !equalIntSlice(got.Files[0].Lines, []int{7, 13, 42}) {
+		t.Errorf("lines = %v, want [7 13 42] (sorted, deduped)", got.Files[0].Lines)
+	}
+}
+
+func TestDoSearch_LinesOnly_StripsCommonRootPrefix(t *testing.T) {
+	hound := `{"Results":{"r":{"Matches":[
+		{"Filename":"go/src/fs/services/a/x.go","Matches":[{"Line":"a","LineNumber":1,"Before":[],"After":[]}]},
+		{"Filename":"go/src/fs/services/b/y.go","Matches":[{"Line":"b","LineNumber":2,"Before":[],"After":[]}]},
+		{"Filename":"go/src/fs/services/c/z.go","Matches":[{"Line":"c","LineNumber":3,"Before":[],"After":[]}]}
+	],"FilesWithMatch":3}}}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", LinesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got linesOnlyDecoded
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Root != "go/src/fs/services/" {
+		t.Errorf("root = %q, want %q", got.Root, "go/src/fs/services/")
+	}
+	gotPaths := map[string]bool{}
+	for _, f := range got.Files {
+		gotPaths[f.Path] = true
+	}
+	for _, want := range []string{"a/x.go", "b/y.go", "c/z.go"} {
+		if !gotPaths[want] {
+			t.Errorf("missing stripped path %q in %+v", want, got.Files)
+		}
+	}
+}
+
+func TestDoSearch_LinesOnly_SingleRepoLiftsRepoToTopLevel(t *testing.T) {
+	hound := `{"Results":{"onlyrepo":{"Matches":[{"Filename":"x.go","Matches":[{"Line":"a","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1}}}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", LinesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got linesOnlyDecoded
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Repo != "onlyrepo" {
+		t.Errorf("repo not lifted to top level; got %q in response: %s", got.Repo, out)
+	}
+	for _, f := range got.Files {
+		if f.Repo != "" {
+			t.Errorf("per-entry repo still populated after lift: %+v", f)
+		}
+	}
+}
+
+func TestDoSearch_LinesOnly_BudgetTruncates(t *testing.T) {
+	// Build a response with many small files so the budget can drop some.
+	var b strings.Builder
+	b.WriteString(`{"Results":{"r":{"Matches":[`)
+	const n = 50
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"Filename":"pkg/sub/file_%04d.go","Matches":[{"Line":"a","LineNumber":1,"Before":[],"After":[]}]}`, i)
+	}
+	b.WriteString(`],"FilesWithMatch":`)
+	fmt.Fprintf(&b, `%d}}}`, n)
+	server := newFakeHoundServer(t, b.String())
+	defer server.Close()
+
+	budget := 100 // ~400 bytes — too small to fit all 50 entries
+	out, err := doSearch(server.URL, SearchInput{Query: "x", LinesOnly: true, MaxResponseTokens: &budget})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got linesOnlyDecoded
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.Truncated {
+		t.Errorf("expected truncated=true with tight budget, got: %s", out)
+	}
+	if got.NextOffset == 0 {
+		t.Errorf("expected non-zero next_offset on truncated response, got: %s", out)
+	}
+	if len(got.Files) >= n {
+		t.Errorf("budget did not drop any files: got %d/%d", len(got.Files), n)
+	}
+}
+
+func TestDoSearch_LinesOnly_OffsetPaginates(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"Results":{"r":{"Matches":[`)
+	for i := 0; i < 10; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"Filename":"file_%02d.go","Matches":[{"Line":"a","LineNumber":1,"Before":[],"After":[]}]}`, i)
+	}
+	b.WriteString(`],"FilesWithMatch":10}}}`)
+	server := newFakeHoundServer(t, b.String())
+	defer server.Close()
+
+	offset := 5
+	out, err := doSearch(server.URL, SearchInput{Query: "x", LinesOnly: true, Offset: &offset})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got linesOnlyDecoded
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Files) != 5 {
+		t.Fatalf("offset=5 should leave 5 files, got %d", len(got.Files))
+	}
+	if got.Files[0].Path != "file_05.go" {
+		t.Errorf("first file after offset = %q, want file_05.go", got.Files[0].Path)
+	}
+}
+
+func TestDoSearch_FilesOnlyTakesPrecedenceOverLinesOnly(t *testing.T) {
+	// When both flags are set, files_only wins (it's the cheaper output).
+	hound := `{"Results":{"r":{"Matches":[{"Filename":"x.go","Matches":[{"Line":"a","LineNumber":42,"Before":[],"After":[]}]}],"FilesWithMatch":1}}}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true, LinesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(out, &top); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := top["files_only"]; !ok {
+		t.Errorf("expected files_only response shape when both flags set: %s", out)
+	}
+	if _, ok := top["lines_only"]; ok {
+		t.Errorf("lines_only field leaked into files_only response: %s", out)
+	}
+}
+
+func TestDoSearch_LinesOnly_LogIncludesFlag(t *testing.T) {
+	hound := `{"Results":{"r":{"Matches":[{"Filename":"x.go","Matches":[{"Line":"a","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1}}}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	buf, restore := captureLogs(t)
+	defer restore()
+
+	if _, err := doSearch(server.URL, SearchInput{Query: "foo", LinesOnly: true}); err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	if !strings.Contains(buf.String(), "lines_only=true") {
+		t.Errorf("log line missing lines_only=true flag: %s", buf.String())
+	}
+}
+
+func equalIntSlice(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

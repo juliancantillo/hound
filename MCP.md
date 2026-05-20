@@ -70,10 +70,10 @@ The `--hound-addr` flag takes priority over the `HOUND_ADDR` environment variabl
 One line per tool invocation, written to stderr (always) and to `--log-file` (if set):
 
 ```
-[hound-mcp] 2026/05/19 16:30:58.868019 search query="NewServer" files_only=true kind="" → 612 bytes in 41.2ms truncated=false
+[hound-mcp] 2026/05/19 16:30:58.868019 search query="NewServer" files_only=true lines_only=false kind="" → 612 bytes in 41.2ms truncated=false
 [hound-mcp] 2026/05/19 16:30:59.102331 list_repos → 5 repos / 248 bytes in 7.8ms
 [hound-mcp] 2026/05/19 16:31:00.554017 get_excludes repo="mn" → 322 bytes in 4.1ms
-[hound-mcp] 2026/05/19 16:31:01.811220 search query="x" files_only=false kind="" ERROR in 12.4ms: failed to connect to Hound server at http://localhost:6080: dial tcp: connection refused
+[hound-mcp] 2026/05/19 16:31:01.811220 search query="x" files_only=false lines_only=false kind="" ERROR in 12.4ms: failed to connect to Hound server at http://localhost:6080: dial tcp: connection refused
 ```
 
 Plus one startup line: `starting hound-mcp pid=… hound_addr=… log_file=…`.

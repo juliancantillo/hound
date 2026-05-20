@@ -37,6 +37,7 @@ type SearchInput struct {
 	Context      *int   `json:"context,omitempty" jsonschema_description:"Number of context lines to include before and after each match. Default 0 (match line only); pass an explicit value (e.g., 2) when you actually need surrounding code. Clamped to a maximum of 20."`
 	Limit        *int   `json:"limit,omitempty" jsonschema_description:"Maximum number of matches returned per repository. Lower this when a broad query would otherwise return very large results."`
 	FilesOnly    bool   `json:"files_only,omitempty" jsonschema_description:"If true, return only the list of matching file paths with a per-file match count and no match bodies — analogous to 'rg -l'. Use for first-pass discovery, then read specific files with Read."`
+	LinesOnly    bool   `json:"lines_only,omitempty" jsonschema_description:"If true, return file paths plus the line numbers of every match, without match bodies or surrounding context — analogous to 'rg -ln'. This is the middle ground between 'files_only' (paths only) and the default match-body mode: cheap enough for broad sweeps, yet gives the line positions you need to Read each file at targeted offsets. Use after 'files_only' returned more files than you want to read whole. Ignored if 'files_only' is also true."`
 	MaxResponseTokens *int `json:"max_response_tokens,omitempty" jsonschema_description:"Approximate cap on the response token count (1 token ≈ 4 bytes). Default 2000. When exceeded, files are dropped from the end of the result; the response gains 'truncated': true and 'next_offset' so the caller can paginate via the 'offset' field. Set to 0 to disable the cap."`
 	Offset            *int `json:"offset,omitempty" jsonschema_description:"Number of files to skip from the start of the result set, for paginating responses that were previously truncated. Pair with the 'next_offset' value returned in a prior truncated response."`
 	Kind              string `json:"kind,omitempty" jsonschema_description:"Optional query helper. 'symbol' treats 'query' as an identifier and searches for its case/style variants (camelCase, PascalCase, snake_case) in a single call, with word-boundary anchoring. Default (empty/unset) treats 'query' as an RE2 regex (or literal when 'literal' is true)."`
@@ -52,12 +53,19 @@ const searchToolDescription = `Search the source code of one or more indexed rep
 
 For first-pass discovery prefer 'files_only': true — this returns just the matching file paths with per-file counts (analogous to 'rg -l') and is typically 5–10x cheaper than the default match-body output. Only switch to match-body mode when you actually need to read the hits inline and Read on the file is not a better choice.
 
+When 'files_only' returned more files than you want to read whole, follow up with 'lines_only': true on the same query — that returns each matching file with the list of line numbers where it hit (analogous to 'rg -ln'), without match bodies. The line numbers let you Read each file at a targeted offset instead of reading whole files.
+
 If you don't know the casing convention used in the codebase (camelCase vs PascalCase vs snake_case), pass kind: "symbol" with an identifier; the wrapper runs all three variants in one search instead of you probing each.
 
 Typical workflow:
   1. search({query: "NewServer", files_only: true})
   2. → pick the most relevant path from the result
   3. Read that file (and use search with a tighter regex if you need cross-file follow-ups)
+
+When the files_only list is too long to read whole:
+  1. search({query: "NewServer", files_only: true})              — get the list of files
+  2. search({query: "NewServer", lines_only: true, files: "<regex>"}) — get line numbers per file
+  3. Read each interesting file at the offset of its first hit
 
 Narrow noisy queries with 'repos', 'files', and 'excludeFiles' before lowering 'limit'. Common excludeFiles patterns: '_test\.go$', '\.pb\.go$', '_mock', 'vendor/', 'node_modules/', 'dist/'.`
 
@@ -68,13 +76,13 @@ func doSearch(houndAddr string, input SearchInput) (json.RawMessage, error) {
 	out, err := doSearchInner(houndAddr, input)
 	dur := time.Since(start)
 	if err != nil {
-		logger.Printf("search query=%q files_only=%v kind=%q ERROR in %s: %v",
-			input.Query, input.FilesOnly, input.Kind, dur, err)
+		logger.Printf("search query=%q files_only=%v lines_only=%v kind=%q ERROR in %s: %v",
+			input.Query, input.FilesOnly, input.LinesOnly, input.Kind, dur, err)
 		return nil, err
 	}
 	truncated := bytes.Contains(out, []byte(`"truncated":true`))
-	logger.Printf("search query=%q files_only=%v kind=%q → %d bytes in %s truncated=%v",
-		input.Query, input.FilesOnly, input.Kind, len(out), dur, truncated)
+	logger.Printf("search query=%q files_only=%v lines_only=%v kind=%q → %d bytes in %s truncated=%v",
+		input.Query, input.FilesOnly, input.LinesOnly, input.Kind, len(out), dur, truncated)
 	return out, nil
 }
 
@@ -153,6 +161,9 @@ func doSearchInner(houndAddr string, input SearchInput) (json.RawMessage, error)
 
 	if input.FilesOnly {
 		return toFilesOnly(raw, budget, offset)
+	}
+	if input.LinesOnly {
+		return toLinesOnly(raw, budget, offset)
 	}
 
 	return applyTokenBudget(raw, budget, offset)
@@ -400,6 +411,136 @@ func compactFilesOnly(out *filesOnlyResponse, entries []fileEntry) {
 	}
 
 	out.Files = make([]fileEntry, 0, len(entries))
+	for _, e := range entries {
+		c := e
+		if singleRepo != "" {
+			c.Repo = ""
+		}
+		if root != "" {
+			c.Path = strings.TrimPrefix(c.Path, root)
+		}
+		out.Files = append(out.Files, c)
+	}
+}
+
+type linesOnlyFileEntry struct {
+	Repo  string `json:"repo,omitempty"`
+	Path  string `json:"path"`
+	Lines []int  `json:"lines"`
+}
+
+type linesOnlyResponse struct {
+	LinesOnly  bool                 `json:"lines_only"`
+	Repo       string               `json:"repo,omitempty"`
+	Root       string               `json:"root,omitempty"`
+	Files      []linesOnlyFileEntry `json:"files"`
+	Truncated  bool                 `json:"truncated"`
+	NextOffset int                  `json:"next_offset,omitempty"`
+}
+
+// toLinesOnly transforms a raw hound search response into the lines_only
+// shape: file paths paired with the sorted, de-duplicated list of line
+// numbers where matches occurred. The middle ground between files_only
+// (paths and counts) and the default match-body output.
+func toLinesOnly(raw json.RawMessage, budget, offset int) (json.RawMessage, error) {
+	var parsed houndResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("failed to parse hound response for lines_only: %w", err)
+	}
+
+	all := []linesOnlyFileEntry{}
+	for repo, r := range parsed.Results {
+		for _, fm := range r.Matches {
+			lines := make([]int, 0, len(fm.Matches))
+			seen := map[int]bool{}
+			for _, m := range fm.Matches {
+				if seen[m.LineNumber] {
+					continue
+				}
+				seen[m.LineNumber] = true
+				lines = append(lines, m.LineNumber)
+			}
+			sort.Ints(lines)
+			all = append(all, linesOnlyFileEntry{
+				Repo:  repo,
+				Path:  fm.Filename,
+				Lines: lines,
+			})
+		}
+	}
+
+	// Stable ordering: by repo then path. Go map iteration is non-deterministic
+	// so without this the output flickers between calls and pagination breaks.
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Repo != all[j].Repo {
+			return all[i].Repo < all[j].Repo
+		}
+		return all[i].Path < all[j].Path
+	})
+
+	if offset > len(all) {
+		offset = len(all)
+	}
+	windowed := all[offset:]
+
+	out := linesOnlyResponse{LinesOnly: true, Files: []linesOnlyFileEntry{}}
+	compactLinesOnly(&out, windowed)
+	if budget <= 0 {
+		return json.Marshal(out)
+	}
+
+	// compactLinesOnly already populated out.Files with the compacted entries;
+	// fit as many as the budget allows, dropping whole files from the end.
+	compact := out.Files
+	out.Files = []linesOnlyFileEntry{}
+	budgetBytes := budget * bytesPerToken
+	for i, f := range compact {
+		out.Files = append(out.Files, f)
+		size, err := approxJSONSize(out)
+		if err != nil {
+			return nil, err
+		}
+		if size > budgetBytes {
+			out.Files = out.Files[:len(out.Files)-1]
+			out.Truncated = true
+			out.NextOffset = offset + i
+			break
+		}
+	}
+
+	return json.Marshal(out)
+}
+
+// compactLinesOnly mirrors compactFilesOnly: lifts the repo to the top level
+// when every entry shares one, and strips a common '/'-aligned path prefix
+// into Root. Entries are expected to already be sorted.
+func compactLinesOnly(out *linesOnlyResponse, entries []linesOnlyFileEntry) {
+	if len(entries) == 0 {
+		out.Files = []linesOnlyFileEntry{}
+		return
+	}
+
+	singleRepo := entries[0].Repo
+	for _, e := range entries[1:] {
+		if e.Repo != singleRepo {
+			singleRepo = ""
+			break
+		}
+	}
+	if singleRepo != "" {
+		out.Repo = singleRepo
+	}
+
+	paths := make([]string, len(entries))
+	for i, e := range entries {
+		paths[i] = e.Path
+	}
+	root := commonPathPrefix(paths)
+	if root != "" {
+		out.Root = root
+	}
+
+	out.Files = make([]linesOnlyFileEntry, 0, len(entries))
 	for _, e := range entries {
 		c := e
 		if singleRepo != "" {
