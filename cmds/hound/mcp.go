@@ -13,6 +13,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/firebase/genkit/go/ai"
@@ -26,6 +27,69 @@ import (
 // startup to redirect it to a file instead — useful because Claude Code
 // usually swallows the stderr of MCP servers it launches.
 var logger = log.New(os.Stderr, "[hound-mcp] ", log.LstdFlags|log.Lmicroseconds)
+
+// repoConfigCache holds the per-repo configuration the MCP wrapper needs to
+// enrich search results — currently just the optional working-copy-root path.
+// It populates lazily on first use from /api/v1/repos so the wrapper doesn't
+// have to do a second HTTP call per search request. We don't bother
+// invalidating because repo config is set at houndd startup; if it changes,
+// restart hound-mcp too.
+type repoConfigCache struct {
+	mu      sync.RWMutex
+	roots   map[string]string // repo name → WorkingCopyRoot
+	loaded  bool
+}
+
+func newRepoConfigCache() *repoConfigCache {
+	return &repoConfigCache{roots: map[string]string{}}
+}
+
+// repoCache is the wrapper's lazy view of houndd's per-repo configuration.
+// Tests call resetRepoCache to force a refresh.
+var repoCache = newRepoConfigCache()
+
+func resetRepoCache() {
+	repoCache.mu.Lock()
+	defer repoCache.mu.Unlock()
+	repoCache.roots = map[string]string{}
+	repoCache.loaded = false
+}
+
+// workingCopyRoot returns the configured working-copy-root for a repo, or "" if
+// unknown / unconfigured / unreachable. Failures to talk to hound are silent —
+// the field is informational, so we'd rather omit it than fail the search.
+func (c *repoConfigCache) workingCopyRoot(houndAddr, repo string) string {
+	c.mu.RLock()
+	if c.loaded {
+		root := c.roots[repo]
+		c.mu.RUnlock()
+		return root
+	}
+	c.mu.RUnlock()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.loaded {
+		return c.roots[repo]
+	}
+	resp, err := http.Get(fmt.Sprintf("%s/api/v1/repos", houndAddr))
+	if err != nil {
+		// Don't mark as loaded; let the next call retry.
+		return ""
+	}
+	defer resp.Body.Close()
+	var parsed map[string]struct {
+		WorkingCopyRoot string `json:"working-copy-root"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return ""
+	}
+	for name, r := range parsed {
+		c.roots[name] = r.WorkingCopyRoot
+	}
+	c.loaded = true
+	return c.roots[repo]
+}
 
 type SearchInput struct {
 	Query        string `json:"query" jsonschema_description:"Pattern to search for. Treated as an RE2 regular expression unless 'literal' is true. Examples: 'func\\s+Setup\\(', 'TODO\\(\\w+\\)', 'NewServer'."`
@@ -57,10 +121,12 @@ When 'files_only' returned more files than you want to read whole, follow up wit
 
 If you don't know the casing convention used in the codebase (camelCase vs PascalCase vs snake_case), pass kind: "symbol" with an identifier; the wrapper runs all three variants in one search instead of you probing each.
 
+Result paths are repo-relative. If a response contains 'working_copy_root' (either at the top level for a single-repo result or per file entry / per repo block for multi-repo), prepend that absolute path to the repo-relative 'path' before calling Read. Empty/absent means no local working copy is mapped — Read will need a different strategy in that case.
+
 Typical workflow:
   1. search({query: "NewServer", files_only: true})
   2. → pick the most relevant path from the result
-  3. Read that file (and use search with a tighter regex if you need cross-file follow-ups)
+  3. Read at <working_copy_root><root><path> (and use search with a tighter regex if you need cross-file follow-ups)
 
 When the files_only list is too long to read whole:
   1. search({query: "NewServer", files_only: true})              — get the list of files
@@ -160,13 +226,13 @@ func doSearchInner(houndAddr string, input SearchInput) (json.RawMessage, error)
 	}
 
 	if input.FilesOnly {
-		return toFilesOnly(raw, budget, offset)
+		return toFilesOnly(houndAddr, raw, budget, offset)
 	}
 	if input.LinesOnly {
-		return toLinesOnly(raw, budget, offset)
+		return toLinesOnly(houndAddr, raw, budget, offset)
 	}
 
-	return applyTokenBudget(raw, budget, offset)
+	return applyTokenBudget(houndAddr, raw, budget, offset)
 }
 
 // defaultMaxResponseTokens is the wrapper-side cap on the approximate token
@@ -194,18 +260,20 @@ type houndResponse struct {
 }
 
 type fileEntry struct {
-	Repo    string `json:"repo,omitempty"`
-	Path    string `json:"path"`
-	Matches int    `json:"matches"`
+	Repo            string `json:"repo,omitempty"`
+	Path            string `json:"path"`
+	Matches         int    `json:"matches"`
+	WorkingCopyRoot string `json:"working_copy_root,omitempty"`
 }
 
 type filesOnlyResponse struct {
-	FilesOnly  bool        `json:"files_only"`
-	Repo       string      `json:"repo,omitempty"`
-	Root       string      `json:"root,omitempty"`
-	Files      []fileEntry `json:"files"`
-	Truncated  bool        `json:"truncated"`
-	NextOffset int         `json:"next_offset,omitempty"`
+	FilesOnly       bool        `json:"files_only"`
+	Repo            string      `json:"repo,omitempty"`
+	WorkingCopyRoot string      `json:"working_copy_root,omitempty"`
+	Root            string      `json:"root,omitempty"`
+	Files           []fileEntry `json:"files"`
+	Truncated       bool        `json:"truncated"`
+	NextOffset      int         `json:"next_offset,omitempty"`
 }
 
 // splitIdentifier breaks an identifier into its word-parts regardless of the
@@ -312,7 +380,7 @@ func commonPathPrefix(paths []string) string {
 	return pfx[:i+1]
 }
 
-func toFilesOnly(raw json.RawMessage, budget, offset int) (json.RawMessage, error) {
+func toFilesOnly(houndAddr string, raw json.RawMessage, budget, offset int) (json.RawMessage, error) {
 	var parsed houndResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return nil, fmt.Errorf("failed to parse hound response for files_only: %w", err)
@@ -320,11 +388,13 @@ func toFilesOnly(raw json.RawMessage, budget, offset int) (json.RawMessage, erro
 
 	all := []fileEntry{}
 	for repo, r := range parsed.Results {
+		root := repoCache.workingCopyRoot(houndAddr, repo)
 		for _, fm := range r.Matches {
 			all = append(all, fileEntry{
-				Repo:    repo,
-				Path:    fm.Filename,
-				Matches: len(fm.Matches),
+				Repo:            repo,
+				Path:            fm.Filename,
+				Matches:         len(fm.Matches),
+				WorkingCopyRoot: root,
 			})
 		}
 	}
@@ -390,14 +460,17 @@ func compactFilesOnly(out *filesOnlyResponse, entries []fileEntry) {
 
 	// Single-repo lift.
 	singleRepo := entries[0].Repo
+	singleRoot := entries[0].WorkingCopyRoot
 	for _, e := range entries[1:] {
 		if e.Repo != singleRepo {
 			singleRepo = ""
+			singleRoot = ""
 			break
 		}
 	}
 	if singleRepo != "" {
 		out.Repo = singleRepo
+		out.WorkingCopyRoot = singleRoot
 	}
 
 	// Common-path-prefix strip.
@@ -415,6 +488,7 @@ func compactFilesOnly(out *filesOnlyResponse, entries []fileEntry) {
 		c := e
 		if singleRepo != "" {
 			c.Repo = ""
+			c.WorkingCopyRoot = ""
 		}
 		if root != "" {
 			c.Path = strings.TrimPrefix(c.Path, root)
@@ -424,25 +498,27 @@ func compactFilesOnly(out *filesOnlyResponse, entries []fileEntry) {
 }
 
 type linesOnlyFileEntry struct {
-	Repo  string `json:"repo,omitempty"`
-	Path  string `json:"path"`
-	Lines []int  `json:"lines"`
+	Repo            string `json:"repo,omitempty"`
+	Path            string `json:"path"`
+	Lines           []int  `json:"lines"`
+	WorkingCopyRoot string `json:"working_copy_root,omitempty"`
 }
 
 type linesOnlyResponse struct {
-	LinesOnly  bool                 `json:"lines_only"`
-	Repo       string               `json:"repo,omitempty"`
-	Root       string               `json:"root,omitempty"`
-	Files      []linesOnlyFileEntry `json:"files"`
-	Truncated  bool                 `json:"truncated"`
-	NextOffset int                  `json:"next_offset,omitempty"`
+	LinesOnly       bool                 `json:"lines_only"`
+	Repo            string               `json:"repo,omitempty"`
+	WorkingCopyRoot string               `json:"working_copy_root,omitempty"`
+	Root            string               `json:"root,omitempty"`
+	Files           []linesOnlyFileEntry `json:"files"`
+	Truncated       bool                 `json:"truncated"`
+	NextOffset      int                  `json:"next_offset,omitempty"`
 }
 
 // toLinesOnly transforms a raw hound search response into the lines_only
 // shape: file paths paired with the sorted, de-duplicated list of line
 // numbers where matches occurred. The middle ground between files_only
 // (paths and counts) and the default match-body output.
-func toLinesOnly(raw json.RawMessage, budget, offset int) (json.RawMessage, error) {
+func toLinesOnly(houndAddr string, raw json.RawMessage, budget, offset int) (json.RawMessage, error) {
 	var parsed houndResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return nil, fmt.Errorf("failed to parse hound response for lines_only: %w", err)
@@ -450,6 +526,7 @@ func toLinesOnly(raw json.RawMessage, budget, offset int) (json.RawMessage, erro
 
 	all := []linesOnlyFileEntry{}
 	for repo, r := range parsed.Results {
+		root := repoCache.workingCopyRoot(houndAddr, repo)
 		for _, fm := range r.Matches {
 			lines := make([]int, 0, len(fm.Matches))
 			seen := map[int]bool{}
@@ -462,9 +539,10 @@ func toLinesOnly(raw json.RawMessage, budget, offset int) (json.RawMessage, erro
 			}
 			sort.Ints(lines)
 			all = append(all, linesOnlyFileEntry{
-				Repo:  repo,
-				Path:  fm.Filename,
-				Lines: lines,
+				Repo:            repo,
+				Path:            fm.Filename,
+				Lines:           lines,
+				WorkingCopyRoot: root,
 			})
 		}
 	}
@@ -521,14 +599,17 @@ func compactLinesOnly(out *linesOnlyResponse, entries []linesOnlyFileEntry) {
 	}
 
 	singleRepo := entries[0].Repo
+	singleRoot := entries[0].WorkingCopyRoot
 	for _, e := range entries[1:] {
 		if e.Repo != singleRepo {
 			singleRepo = ""
+			singleRoot = ""
 			break
 		}
 	}
 	if singleRepo != "" {
 		out.Repo = singleRepo
+		out.WorkingCopyRoot = singleRoot
 	}
 
 	paths := make([]string, len(entries))
@@ -545,12 +626,64 @@ func compactLinesOnly(out *linesOnlyResponse, entries []linesOnlyFileEntry) {
 		c := e
 		if singleRepo != "" {
 			c.Repo = ""
+			c.WorkingCopyRoot = ""
 		}
 		if root != "" {
 			c.Path = strings.TrimPrefix(c.Path, root)
 		}
 		out.Files = append(out.Files, c)
 	}
+}
+
+// enrichRawWithWorkingCopyRoots injects the per-repo working_copy_root into
+// each block under Results without otherwise touching the response. Used on
+// the cheap-pass-through paths of applyTokenBudget so that callers in raw
+// mode also get the path-mapping hint. If none of the repos has a
+// working-copy-root configured, the raw bytes are returned unchanged.
+func enrichRawWithWorkingCopyRoots(houndAddr string, raw json.RawMessage) (json.RawMessage, error) {
+	var parsed struct {
+		Results map[string]json.RawMessage `json:"Results"`
+		Stats   json.RawMessage            `json:"Stats,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return raw, nil
+	}
+	if len(parsed.Results) == 0 {
+		return raw, nil
+	}
+
+	anyRoot := false
+	enrichedResults := map[string]json.RawMessage{}
+	for repo, repoJSON := range parsed.Results {
+		root := repoCache.workingCopyRoot(houndAddr, repo)
+		if root == "" {
+			enrichedResults[repo] = repoJSON
+			continue
+		}
+		anyRoot = true
+		// Merge {"working_copy_root": "<root>"} into the per-repo object.
+		var asMap map[string]json.RawMessage
+		if err := json.Unmarshal(repoJSON, &asMap); err != nil {
+			enrichedResults[repo] = repoJSON
+			continue
+		}
+		rootJSON, _ := json.Marshal(root)
+		asMap["working_copy_root"] = rootJSON
+		encoded, err := json.Marshal(asMap)
+		if err != nil {
+			enrichedResults[repo] = repoJSON
+			continue
+		}
+		enrichedResults[repo] = encoded
+	}
+	if !anyRoot {
+		return raw, nil
+	}
+	final := struct {
+		Results map[string]json.RawMessage `json:"Results"`
+		Stats   json.RawMessage            `json:"Stats,omitempty"`
+	}{Results: enrichedResults, Stats: parsed.Stats}
+	return json.Marshal(final)
 }
 
 // approxJSONSize returns the JSON-encoded length of v. Used to gauge whether
@@ -568,14 +701,14 @@ func approxJSONSize(v interface{}) (int, error) {
 // until the encoded response fits within budget*bytesPerToken bytes. The
 // returned message has a top-level 'truncated' and 'next_offset' added when
 // truncation occurred; otherwise the original raw response passes through.
-func applyTokenBudget(raw json.RawMessage, budget, offset int) (json.RawMessage, error) {
+func applyTokenBudget(houndAddr string, raw json.RawMessage, budget, offset int) (json.RawMessage, error) {
 	if budget <= 0 && offset == 0 {
-		return raw, nil
+		return enrichRawWithWorkingCopyRoots(houndAddr, raw)
 	}
 	budgetBytes := budget * bytesPerToken
 	if budget > 0 && len(raw) <= budgetBytes && offset == 0 {
 		// Cheap pass-through: small enough already and nothing to skip.
-		return raw, nil
+		return enrichRawWithWorkingCopyRoots(houndAddr, raw)
 	}
 
 	// Parse the response into a shape we can edit.
@@ -597,9 +730,10 @@ func applyTokenBudget(raw json.RawMessage, budget, offset int) (json.RawMessage,
 	sort.Strings(repos)
 
 	type repoMatches struct {
-		Matches        []json.RawMessage `json:"Matches"`
-		FilesWithMatch int               `json:"FilesWithMatch"`
-		Revision       string            `json:"Revision,omitempty"`
+		Matches         []json.RawMessage `json:"Matches"`
+		FilesWithMatch  int               `json:"FilesWithMatch"`
+		Revision        string            `json:"Revision,omitempty"`
+		WorkingCopyRoot string            `json:"working_copy_root,omitempty"`
 	}
 	repoData := map[string]*repoMatches{}
 	for _, repo := range repos {
@@ -607,6 +741,7 @@ func applyTokenBudget(raw json.RawMessage, budget, offset int) (json.RawMessage,
 		if err := json.Unmarshal(parsed.Results[repo], &rm); err != nil {
 			continue
 		}
+		rm.WorkingCopyRoot = repoCache.workingCopyRoot(houndAddr, repo)
 		repoData[repo] = &rm
 	}
 
@@ -693,13 +828,15 @@ func applyTokenBudget(raw json.RawMessage, budget, offset int) (json.RawMessage,
 		rm := repoData[repo]
 		// Encode a fresh per-repo object with the trimmed Matches list.
 		out := struct {
-			Matches        []json.RawMessage `json:"Matches"`
-			FilesWithMatch int               `json:"FilesWithMatch"`
-			Revision       string            `json:"Revision,omitempty"`
+			Matches         []json.RawMessage `json:"Matches"`
+			FilesWithMatch  int               `json:"FilesWithMatch"`
+			Revision        string            `json:"Revision,omitempty"`
+			WorkingCopyRoot string            `json:"working_copy_root,omitempty"`
 		}{
-			Matches:        matches,
-			FilesWithMatch: rm.FilesWithMatch,
-			Revision:       rm.Revision,
+			Matches:         matches,
+			FilesWithMatch:  rm.FilesWithMatch,
+			Revision:        rm.Revision,
+			WorkingCopyRoot: rm.WorkingCopyRoot,
 		}
 		encoded, err := json.Marshal(out)
 		if err != nil {

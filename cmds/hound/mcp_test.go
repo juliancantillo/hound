@@ -1030,3 +1030,193 @@ func equalIntSlice(a, b []int) bool {
 	}
 	return true
 }
+
+// newDualRouteHoundServer returns a test server that responds to
+// /api/v1/repos with reposBody and to anything else (e.g. /api/v1/search)
+// with searchBody. Lets a single fixture drive both the wrapper's
+// working_copy_root lookup and the actual search response.
+func newDualRouteHoundServer(t *testing.T, reposBody, searchBody string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/v1/repos") {
+			_, _ = w.Write([]byte(reposBody))
+			return
+		}
+		_, _ = w.Write([]byte(searchBody))
+	}))
+}
+
+func TestDoSearch_FilesOnly_IncludesWorkingCopyRoot(t *testing.T) {
+	resetRepoCache()
+	reposBody := `{"only-repo":{"url":"https://example.com/x.git","working-copy-root":"/Users/julian/src/mn/projects/fullstory/"}}`
+	searchBody := `{"Results":{"only-repo":{"Matches":[{"Filename":"go/src/fs/a.go","Matches":[{"Line":"hit","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1}}}`
+	server := newDualRouteHoundServer(t, reposBody, searchBody)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Repo            string `json:"repo"`
+		WorkingCopyRoot string `json:"working_copy_root"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	if got.WorkingCopyRoot != "/Users/julian/src/mn/projects/fullstory/" {
+		t.Errorf("working_copy_root = %q, want the configured path\nbody: %s", got.WorkingCopyRoot, out)
+	}
+	if got.Repo != "only-repo" {
+		t.Errorf("expected repo lifted to top level, got %q", got.Repo)
+	}
+}
+
+func TestDoSearch_FilesOnly_WorkingCopyRootOmittedWhenUnconfigured(t *testing.T) {
+	resetRepoCache()
+	reposBody := `{"only-repo":{"url":"https://example.com/x.git"}}` // no working-copy-root
+	searchBody := `{"Results":{"only-repo":{"Matches":[{"Filename":"a.go","Matches":[{"Line":"x","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1}}}`
+	server := newDualRouteHoundServer(t, reposBody, searchBody)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(out, &top); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := top["working_copy_root"]; ok {
+		t.Errorf("working_copy_root key should be omitted when unconfigured: %s", out)
+	}
+}
+
+func TestDoSearch_FilesOnly_MultiRepo_WorkingCopyRootPerEntry(t *testing.T) {
+	resetRepoCache()
+	reposBody := `{
+		"repoA":{"url":"https://example.com/a.git","working-copy-root":"/disk/a/"},
+		"repoB":{"url":"https://example.com/b.git","working-copy-root":"/disk/b/"}
+	}`
+	searchBody := `{
+		"Results": {
+			"repoA":{"Matches":[{"Filename":"a.go","Matches":[{"Line":"x","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1},
+			"repoB":{"Matches":[{"Filename":"b.go","Matches":[{"Line":"x","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1}
+		}
+	}`
+	server := newDualRouteHoundServer(t, reposBody, searchBody)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Repo            string `json:"repo"`
+		WorkingCopyRoot string `json:"working_copy_root"`
+		Files           []struct {
+			Repo            string `json:"repo"`
+			Path            string `json:"path"`
+			WorkingCopyRoot string `json:"working_copy_root"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	// Top-level fields should be empty for multi-repo.
+	if got.WorkingCopyRoot != "" {
+		t.Errorf("top-level working_copy_root should be empty for multi-repo response, got %q", got.WorkingCopyRoot)
+	}
+	byRepo := map[string]string{}
+	for _, f := range got.Files {
+		byRepo[f.Repo] = f.WorkingCopyRoot
+	}
+	if byRepo["repoA"] != "/disk/a/" {
+		t.Errorf("repoA file working_copy_root = %q, want /disk/a/", byRepo["repoA"])
+	}
+	if byRepo["repoB"] != "/disk/b/" {
+		t.Errorf("repoB file working_copy_root = %q, want /disk/b/", byRepo["repoB"])
+	}
+}
+
+func TestDoSearch_LinesOnly_IncludesWorkingCopyRoot(t *testing.T) {
+	resetRepoCache()
+	reposBody := `{"only-repo":{"working-copy-root":"/disk/proj/"}}`
+	searchBody := `{"Results":{"only-repo":{"Matches":[{"Filename":"a.go","Matches":[{"Line":"x","LineNumber":7,"Before":[],"After":[]}]}],"FilesWithMatch":1}}}`
+	server := newDualRouteHoundServer(t, reposBody, searchBody)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", LinesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		WorkingCopyRoot string `json:"working_copy_root"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.WorkingCopyRoot != "/disk/proj/" {
+		t.Errorf("working_copy_root = %q, want /disk/proj/\nbody: %s", got.WorkingCopyRoot, out)
+	}
+}
+
+func TestDoSearch_RawMode_PerRepoWorkingCopyRoot(t *testing.T) {
+	resetRepoCache()
+	// Two-repo response (forces wrapper into the structural rewrite path)
+	// and one of them has a working-copy-root configured.
+	reposBody := `{
+		"repoA":{"working-copy-root":"/disk/a/"},
+		"repoB":{}
+	}`
+	searchBody := `{
+		"Results": {
+			"repoA":{"Matches":[{"Filename":"a.go","Matches":[{"Line":"x","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1},
+			"repoB":{"Matches":[{"Filename":"b.go","Matches":[{"Line":"x","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1}
+		}
+	}`
+	server := newDualRouteHoundServer(t, reposBody, searchBody)
+	defer server.Close()
+
+	// Force the wrapper through its rewrite path by setting a low token budget.
+	budget := 50
+	out, err := doSearch(server.URL, SearchInput{Query: "x", MaxResponseTokens: &budget})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Results map[string]struct {
+			WorkingCopyRoot string `json:"working_copy_root"`
+		} `json:"Results"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	if rA, ok := got.Results["repoA"]; ok {
+		if rA.WorkingCopyRoot != "/disk/a/" {
+			t.Errorf("repoA.working_copy_root = %q, want /disk/a/", rA.WorkingCopyRoot)
+		}
+	}
+	// repoB has no working_copy_root configured; if it survived the budget,
+	// its key must be absent (not "").
+	if _, ok := got.Results["repoB"]; ok {
+		var raw map[string]map[string]json.RawMessage
+		_ = json.Unmarshal(out, &raw)
+		if _, present := raw["Results"]["repoB"]; present {
+			if v, has := raw["Results"]["repoB"]; has {
+				var asMap map[string]json.RawMessage
+				_ = json.Unmarshal(v, &asMap)
+				if _, present := asMap["working_copy_root"]; present {
+					t.Errorf("repoB should not have working_copy_root key when unconfigured: %s", out)
+				}
+			}
+		}
+	}
+}
+
+func TestSearchToolDescription_MentionsWorkingCopyRoot(t *testing.T) {
+	if !strings.Contains(searchToolDescription, "working_copy_root") {
+		t.Errorf("searchToolDescription should explain working_copy_root usage:\n%s", searchToolDescription)
+	}
+}
