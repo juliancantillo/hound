@@ -722,6 +722,11 @@ func TestDoSearch_LogsErrorWhenHoundUnreachable(t *testing.T) {
 	if !strings.Contains(buf.String(), "search") {
 		t.Errorf("expected the log to mention the tool name; got: %s", buf.String())
 	}
+	// The error returned to the model should also lead with the tool name so
+	// the model knows which call failed without having to parse the message.
+	if !strings.Contains(err.Error(), "hound search") {
+		t.Errorf("error returned to caller should begin with 'hound search', got: %v", err)
+	}
 }
 
 func TestDoSearch_LogIncludesTruncationFlag(t *testing.T) {
@@ -1323,6 +1328,46 @@ func TestDoSearch_LinesOnly_ZeroResults_HintsSymbol(t *testing.T) {
 	}
 	if !strings.Contains(got.Hint, "symbol") {
 		t.Errorf("lines_only zero-result hint should suggest kind=\"symbol\", got %q\nbody: %s", got.Hint, out)
+	}
+}
+
+func TestDoSearch_ErrorMessageIncludesToolName(t *testing.T) {
+	resetRepoCache()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close()
+
+	_, err := doSearch(srv.URL, SearchInput{Query: "x"})
+	if err == nil {
+		t.Fatalf("expected error against closed server")
+	}
+	if !strings.Contains(err.Error(), "hound search") {
+		t.Errorf("error should be tagged with tool name 'hound search', got: %v", err)
+	}
+}
+
+func TestDoListRepos_ErrorMessageIncludesToolName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close()
+
+	_, err := doListRepos(srv.URL)
+	if err == nil {
+		t.Fatalf("expected error against closed server")
+	}
+	if !strings.Contains(err.Error(), "hound list_repos") {
+		t.Errorf("error should be tagged with tool name 'hound list_repos', got: %v", err)
+	}
+}
+
+func TestDoGetExcludes_ErrorMessageIncludesToolName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close()
+
+	_, err := doGetExcludes(srv.URL, GetExcludesInput{Repo: "x"})
+	if err == nil {
+		t.Fatalf("expected error against closed server")
+	}
+	if !strings.Contains(err.Error(), "hound get_excludes") {
+		t.Errorf("error should be tagged with tool name 'hound get_excludes', got: %v", err)
 	}
 }
 

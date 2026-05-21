@@ -199,13 +199,13 @@ func doSearchInner(houndAddr string, input SearchInput) (json.RawMessage, error)
 
 	resp, err := http.Get(fmt.Sprintf("%s/api/v1/search?%s", houndAddr, params))
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to Hound server at %s: %w", houndAddr, err)
+		return nil, fmt.Errorf("hound search failed: cannot reach hound at %s: %w", houndAddr, err)
 	}
 	defer resp.Body.Close()
 
 	var raw json.RawMessage
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("hound search failed: cannot decode response: %w", err)
 	}
 
 	// Check for API-level errors (Hound returns 200 with {"Error": "..."})
@@ -213,7 +213,7 @@ func doSearchInner(houndAddr string, input SearchInput) (json.RawMessage, error)
 		Error string `json:"Error"`
 	}
 	if json.Unmarshal(raw, &errCheck) == nil && errCheck.Error != "" {
-		return nil, fmt.Errorf("hound search error: %s", errCheck.Error)
+		return nil, fmt.Errorf("hound search failed: %s", errCheck.Error)
 	}
 
 	budget := defaultMaxResponseTokens
@@ -1015,14 +1015,14 @@ func doListRepos(houndAddr string) (json.RawMessage, error) {
 	resp, err := http.Get(fmt.Sprintf("%s/api/v1/repos", houndAddr))
 	if err != nil {
 		logger.Printf("list_repos ERROR in %s: %v", time.Since(start), err)
-		return nil, fmt.Errorf("failed to connect to Hound server at %s: %w", houndAddr, err)
+		return nil, fmt.Errorf("hound list_repos failed: cannot reach hound at %s: %w", houndAddr, err)
 	}
 	defer resp.Body.Close()
 
 	var result json.RawMessage
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		logger.Printf("list_repos ERROR in %s: %v", time.Since(start), err)
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("hound list_repos failed: cannot decode response: %w", err)
 	}
 	// Count keys at the top level — cheaper than fully parsing.
 	var asMap map[string]json.RawMessage
@@ -1037,14 +1037,14 @@ func doGetExcludes(houndAddr string, input GetExcludesInput) (json.RawMessage, e
 		houndAddr, url.QueryEscape(input.Repo)))
 	if err != nil {
 		logger.Printf("get_excludes repo=%q ERROR in %s: %v", input.Repo, time.Since(start), err)
-		return nil, fmt.Errorf("failed to connect to Hound server at %s: %w", houndAddr, err)
+		return nil, fmt.Errorf("hound get_excludes failed: cannot reach hound at %s: %w", houndAddr, err)
 	}
 	defer resp.Body.Close()
 
 	var result json.RawMessage
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		logger.Printf("get_excludes repo=%q ERROR in %s: %v", input.Repo, time.Since(start), err)
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("hound get_excludes failed: cannot decode response: %w", err)
 	}
 	logger.Printf("get_excludes repo=%q → %d bytes in %s", input.Repo, len(result), time.Since(start))
 	return result, nil
