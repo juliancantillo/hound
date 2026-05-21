@@ -105,6 +105,7 @@ type SearchInput struct {
 	MaxResponseTokens *int `json:"max_response_tokens,omitempty" jsonschema_description:"Approximate cap on the response token count (1 token ≈ 4 bytes). Default 2000. When exceeded, files are dropped from the end of the result; the response gains 'truncated': true and 'next_offset' so the caller can paginate via the 'offset' field. Set to 0 to disable the cap."`
 	Offset            *int `json:"offset,omitempty" jsonschema_description:"Number of files to skip from the start of the result set, for paginating responses that were previously truncated. Pair with the 'next_offset' value returned in a prior truncated response."`
 	Kind              string `json:"kind,omitempty" jsonschema_description:"Optional query helper. 'symbol' treats 'query' as an identifier and searches for its case/style variants (camelCase, PascalCase, snake_case) in a single call, with word-boundary anchoring. Default (empty/unset) treats 'query' as an RE2 regex (or literal when 'literal' is true)."`
+	StrictPaths       bool   `json:"strict_paths,omitempty" jsonschema_description:"If true and working_copy_root is configured for the repo, files_only / lines_only entries whose resolved on-disk path doesn't exist are dropped from the response. Useful for detecting index-vs-disk drift (e.g. a stale hound index referencing a deleted file). Has no effect on the default (match-body) response mode; has no effect when working_copy_root is unset."`
 }
 
 type GetExcludesInput struct {
@@ -226,14 +227,14 @@ func doSearchInner(houndAddr string, input SearchInput) (json.RawMessage, error)
 	}
 
 	if input.FilesOnly {
-		out, err := toFilesOnly(houndAddr, raw, budget, offset)
+		out, err := toFilesOnly(houndAddr, raw, budget, offset, input.StrictPaths)
 		if err != nil {
 			return nil, err
 		}
 		return maybeAttachHint(out, raw, input)
 	}
 	if input.LinesOnly {
-		out, err := toLinesOnly(houndAddr, raw, budget, offset)
+		out, err := toLinesOnly(houndAddr, raw, budget, offset, input.StrictPaths)
 		if err != nil {
 			return nil, err
 		}
@@ -444,7 +445,7 @@ func commonPathPrefix(paths []string) string {
 	return pfx[:i+1]
 }
 
-func toFilesOnly(houndAddr string, raw json.RawMessage, budget, offset int) (json.RawMessage, error) {
+func toFilesOnly(houndAddr string, raw json.RawMessage, budget, offset int, strict bool) (json.RawMessage, error) {
 	var parsed houndResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return nil, fmt.Errorf("failed to parse hound response for files_only: %w", err)
@@ -454,6 +455,9 @@ func toFilesOnly(houndAddr string, raw json.RawMessage, budget, offset int) (jso
 	for repo, r := range parsed.Results {
 		root := repoCache.workingCopyRoot(houndAddr, repo)
 		for _, fm := range r.Matches {
+			if strict && root != "" && !pathExistsOnDisk(root, fm.Filename) {
+				continue
+			}
 			all = append(all, fileEntry{
 				Repo:            repo,
 				Path:            fm.Filename,
@@ -582,7 +586,7 @@ type linesOnlyResponse struct {
 // shape: file paths paired with the sorted, de-duplicated list of line
 // numbers where matches occurred. The middle ground between files_only
 // (paths and counts) and the default match-body output.
-func toLinesOnly(houndAddr string, raw json.RawMessage, budget, offset int) (json.RawMessage, error) {
+func toLinesOnly(houndAddr string, raw json.RawMessage, budget, offset int, strict bool) (json.RawMessage, error) {
 	var parsed houndResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return nil, fmt.Errorf("failed to parse hound response for lines_only: %w", err)
@@ -592,6 +596,9 @@ func toLinesOnly(houndAddr string, raw json.RawMessage, budget, offset int) (jso
 	for repo, r := range parsed.Results {
 		root := repoCache.workingCopyRoot(houndAddr, repo)
 		for _, fm := range r.Matches {
+			if strict && root != "" && !pathExistsOnDisk(root, fm.Filename) {
+				continue
+			}
 			lines := make([]int, 0, len(fm.Matches))
 			seen := map[int]bool{}
 			for _, m := range fm.Matches {
@@ -697,6 +704,23 @@ func compactLinesOnly(out *linesOnlyResponse, entries []linesOnlyFileEntry) {
 		}
 		out.Files = append(out.Files, c)
 	}
+}
+
+// pathExistsOnDisk reports whether root + relPath resolves to a real file.
+// Used by strict_paths to drop stale index entries; failures (missing
+// permission, etc.) are treated as "doesn't exist" so the wrapper degrades
+// to fewer-but-trustworthy results rather than a confusing partial list.
+func pathExistsOnDisk(root, relPath string) bool {
+	if root == "" {
+		return false
+	}
+	full := root
+	if !strings.HasSuffix(full, "/") {
+		full += "/"
+	}
+	full += relPath
+	_, err := os.Stat(full)
+	return err == nil
 }
 
 // enrichRawWithWorkingCopyRoots injects the per-repo working_copy_root into

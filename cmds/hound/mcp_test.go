@@ -1331,6 +1331,144 @@ func TestDoSearch_LinesOnly_ZeroResults_HintsSymbol(t *testing.T) {
 	}
 }
 
+func TestDoSearch_StrictPaths_DropsMissingFiles(t *testing.T) {
+	resetRepoCache()
+	tmp := t.TempDir()
+	// Create one file on disk; the other will be a hound-only ghost.
+	realPath := "alpha/exists.go"
+	if err := os.MkdirAll(tmp+"/alpha", 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(tmp+"/"+realPath, []byte("// ok\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	reposBody := fmt.Sprintf(`{"only-repo":{"working-copy-root":%q}}`, tmp+"/")
+	searchBody := `{
+		"Results": {
+			"only-repo": {
+				"Matches": [
+					{"Filename": "alpha/exists.go", "Matches": [{"Line":"hit","LineNumber":1,"Before":[],"After":[]}]},
+					{"Filename": "alpha/ghost.go",  "Matches": [{"Line":"hit","LineNumber":2,"Before":[],"After":[]}]}
+				],
+				"FilesWithMatch": 2
+			}
+		}
+	}`
+	server := newDualRouteHoundServer(t, reposBody, searchBody)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "hit", FilesOnly: true, StrictPaths: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Files []struct {
+			Path string `json:"path"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	if len(got.Files) != 1 {
+		t.Fatalf("strict_paths should leave only the existing file, got %d entries: %s", len(got.Files), out)
+	}
+	if !strings.HasSuffix(got.Files[0].Path, "exists.go") {
+		t.Errorf("kept file = %q, want the one that exists on disk (exists.go)", got.Files[0].Path)
+	}
+}
+
+func TestDoSearch_StrictPaths_LinesOnly_DropsMissingFiles(t *testing.T) {
+	resetRepoCache()
+	tmp := t.TempDir()
+	if err := os.WriteFile(tmp+"/exists.go", []byte("ok"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	reposBody := fmt.Sprintf(`{"r":{"working-copy-root":%q}}`, tmp+"/")
+	searchBody := `{
+		"Results": {
+			"r": {
+				"Matches": [
+					{"Filename": "exists.go", "Matches": [{"Line":"a","LineNumber":1,"Before":[],"After":[]}]},
+					{"Filename": "ghost.go",  "Matches": [{"Line":"b","LineNumber":1,"Before":[],"After":[]}]}
+				],
+				"FilesWithMatch": 2
+			}
+		}
+	}`
+	server := newDualRouteHoundServer(t, reposBody, searchBody)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", LinesOnly: true, StrictPaths: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Files []struct {
+			Path string `json:"path"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Files) != 1 || !strings.Contains(got.Files[0].Path, "exists.go") {
+		t.Errorf("expected only exists.go, got %+v\nbody: %s", got.Files, out)
+	}
+}
+
+func TestDoSearch_StrictPaths_KeepsAllWhenNoWorkingCopyRoot(t *testing.T) {
+	// strict_paths needs a working_copy_root to resolve files against. When
+	// none is configured, we don't know where to look — keep entries rather
+	// than silently dropping everything.
+	resetRepoCache()
+	reposBody := `{"r":{}}` // no working-copy-root
+	searchBody := `{"Results":{"r":{"Matches":[
+		{"Filename":"a.go","Matches":[{"Line":"x","LineNumber":1,"Before":[],"After":[]}]},
+		{"Filename":"b.go","Matches":[{"Line":"x","LineNumber":1,"Before":[],"After":[]}]}
+	],"FilesWithMatch":2}}}`
+	server := newDualRouteHoundServer(t, reposBody, searchBody)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true, StrictPaths: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Files []json.RawMessage `json:"files"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Files) != 2 {
+		t.Errorf("expected to keep both files when no working_copy_root, got %d: %s", len(got.Files), out)
+	}
+}
+
+func TestDoSearch_StrictPaths_DefaultIsNoFiltering(t *testing.T) {
+	// Without strict_paths, missing files survive.
+	resetRepoCache()
+	tmp := t.TempDir() // empty — nothing on disk
+	reposBody := fmt.Sprintf(`{"r":{"working-copy-root":%q}}`, tmp+"/")
+	searchBody := `{"Results":{"r":{"Matches":[{"Filename":"ghost.go","Matches":[{"Line":"x","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1}}}`
+	server := newDualRouteHoundServer(t, reposBody, searchBody)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "x", FilesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Files []json.RawMessage `json:"files"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Files) != 1 {
+		t.Errorf("strict_paths defaults to off; missing files should survive. got %d: %s", len(got.Files), out)
+	}
+}
+
 func TestDoSearch_ErrorMessageIncludesToolName(t *testing.T) {
 	resetRepoCache()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
