@@ -1220,3 +1220,131 @@ func TestSearchToolDescription_MentionsWorkingCopyRoot(t *testing.T) {
 		t.Errorf("searchToolDescription should explain working_copy_root usage:\n%s", searchToolDescription)
 	}
 }
+
+func TestDoSearch_ZeroResults_NonSymbol_HintsSymbol(t *testing.T) {
+	resetRepoCache()
+	server := newFakeHoundServer(t, `{"Results":{}}`)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "noMatchAnywhere"})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Hint string `json:"hint"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	if !strings.Contains(got.Hint, "symbol") {
+		t.Errorf("zero-result hint should suggest kind=\"symbol\", got %q\nbody: %s", got.Hint, out)
+	}
+}
+
+func TestDoSearch_ZeroResults_SymbolKind_HintsDroppingFilters(t *testing.T) {
+	resetRepoCache()
+	server := newFakeHoundServer(t, `{"Results":{}}`)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{
+		Query: "noSuchIdentifier",
+		Kind:  "symbol",
+		Files: "\\.go$",
+	})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Hint string `json:"hint"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	// On the second-tier hint we want a nudge toward removing files/excludeFiles.
+	if !strings.Contains(strings.ToLower(got.Hint), "drop") &&
+		!strings.Contains(strings.ToLower(got.Hint), "filter") {
+		t.Errorf("zero-result+symbol hint should suggest dropping filters, got %q\nbody: %s", got.Hint, out)
+	}
+}
+
+func TestDoSearch_NonZeroResults_NoHint(t *testing.T) {
+	resetRepoCache()
+	hound := `{"Results":{"r":{"Matches":[{"Filename":"x.go","Matches":[{"Line":"hit","LineNumber":1,"Before":[],"After":[]}]}],"FilesWithMatch":1}}}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "hit"})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(out, &top); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := top["hint"]; ok {
+		t.Errorf("non-empty result should not include a hint key: %s", out)
+	}
+}
+
+func TestDoSearch_FilesOnly_ZeroResults_HintsSymbol(t *testing.T) {
+	resetRepoCache()
+	server := newFakeHoundServer(t, `{"Results":{}}`)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "nothing", FilesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Hint string `json:"hint"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	if !strings.Contains(got.Hint, "symbol") {
+		t.Errorf("files_only zero-result hint should suggest kind=\"symbol\", got %q\nbody: %s", got.Hint, out)
+	}
+}
+
+func TestDoSearch_LinesOnly_ZeroResults_HintsSymbol(t *testing.T) {
+	resetRepoCache()
+	server := newFakeHoundServer(t, `{"Results":{}}`)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "nothing", LinesOnly: true})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Hint string `json:"hint"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	if !strings.Contains(got.Hint, "symbol") {
+		t.Errorf("lines_only zero-result hint should suggest kind=\"symbol\", got %q\nbody: %s", got.Hint, out)
+	}
+}
+
+func TestDoSearch_AllRepoMatchesEmpty_HintsSymbol(t *testing.T) {
+	// Hound might include the repo key with an empty Matches array; that's
+	// still effectively a zero-result outcome.
+	resetRepoCache()
+	hound := `{"Results":{"r":{"Matches":[],"FilesWithMatch":0}}}`
+	server := newFakeHoundServer(t, hound)
+	defer server.Close()
+
+	out, err := doSearch(server.URL, SearchInput{Query: "nothing"})
+	if err != nil {
+		t.Fatalf("doSearch: %v", err)
+	}
+	var got struct {
+		Hint string `json:"hint"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, out)
+	}
+	if !strings.Contains(got.Hint, "symbol") {
+		t.Errorf("Results with only empty Matches should still hint symbol, got %q\nbody: %s", got.Hint, out)
+	}
+}

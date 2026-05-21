@@ -226,13 +226,77 @@ func doSearchInner(houndAddr string, input SearchInput) (json.RawMessage, error)
 	}
 
 	if input.FilesOnly {
-		return toFilesOnly(houndAddr, raw, budget, offset)
+		out, err := toFilesOnly(houndAddr, raw, budget, offset)
+		if err != nil {
+			return nil, err
+		}
+		return maybeAttachHint(out, raw, input)
 	}
 	if input.LinesOnly {
-		return toLinesOnly(houndAddr, raw, budget, offset)
+		out, err := toLinesOnly(houndAddr, raw, budget, offset)
+		if err != nil {
+			return nil, err
+		}
+		return maybeAttachHint(out, raw, input)
 	}
 
-	return applyTokenBudget(houndAddr, raw, budget, offset)
+	out, err := applyTokenBudget(houndAddr, raw, budget, offset)
+	if err != nil {
+		return nil, err
+	}
+	return maybeAttachHint(out, raw, input)
+}
+
+// rawHasMatches reports whether the original (pre-transform) hound response
+// contains at least one actual file match. We use the raw response — not the
+// post-transform output — so file_only / lines_only responses that legitimately
+// have zero matches still get the hint, and so do raw responses where token
+// budgeting removed everything (that's a different problem; don't paper over).
+func rawHasMatches(raw json.RawMessage) bool {
+	var parsed houndResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		// If we can't parse it, assume non-empty — better to skip the hint
+		// than to attach a misleading one.
+		return true
+	}
+	for _, r := range parsed.Results {
+		for _, fm := range r.Matches {
+			if len(fm.Matches) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hintForZeroResults picks the right next step to suggest based on what the
+// caller already tried. The hint is intentionally short — one sentence — so
+// the model doesn't have to spend tokens parsing prose.
+func hintForZeroResults(input SearchInput) string {
+	if input.Kind == "symbol" {
+		if input.Files != "" || input.ExcludeFiles != "" {
+			return `No matches. Try dropping 'files' / 'excludeFiles' filters — the query may match in a file your filters excluded.`
+		}
+		return `No matches. The identifier may not exist; double-check the spelling or try a substring match (kind: "" with a partial regex).`
+	}
+	return `No matches. Try kind: "symbol" to also try camelCase/PascalCase/snake_case variants of the query.`
+}
+
+// maybeAttachHint adds a top-level "hint" field to out when the original
+// hound response contained no matches. Non-empty responses are passed through
+// unchanged.
+func maybeAttachHint(out, raw json.RawMessage, input SearchInput) (json.RawMessage, error) {
+	if rawHasMatches(raw) {
+		return out, nil
+	}
+	hint := hintForZeroResults(input)
+	var asMap map[string]json.RawMessage
+	if err := json.Unmarshal(out, &asMap); err != nil {
+		return out, nil
+	}
+	hintJSON, _ := json.Marshal(hint)
+	asMap["hint"] = hintJSON
+	return json.Marshal(asMap)
 }
 
 // defaultMaxResponseTokens is the wrapper-side cap on the approximate token
